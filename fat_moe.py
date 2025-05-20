@@ -18,10 +18,9 @@ class MoEFeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int, num_experts: int):
         super().__init__()
         self.num_experts = num_experts
-        # Gating network projects the token representation to a distribution
-        # over experts (softmax across *experts* dimension).
+        # Gating network maps each token to a distribution over experts.
         self.gate = nn.Linear(d_model, num_experts, bias=False)
-        # A small feed‑forward network per expert.
+        # A tiny 2‑layer feed‑forward network per expert.
         self.experts = nn.ModuleList(
             [
                 nn.Sequential(
@@ -32,40 +31,44 @@ class MoEFeedForward(nn.Module):
                 for _ in range(num_experts)
             ]
         )
-        # Optional: encourage balanced expert use (simple moving average).
+        # Exponential‑moving average of expert usage for load‑balancing.
         self.register_buffer("_ema_counts", torch.zeros(num_experts), persistent=False)
         self.ema_decay = 0.99
 
+    # ---------------------------------------------------------------------
+    # Public helpers
+    # ---------------------------------------------------------------------
     def load_balance_loss(self) -> torch.Tensor:
         """Return a scalar auxiliary loss that penalises expert imbalance."""
         probs = self._ema_counts / (self._ema_counts.sum() + 1e-9)
         return (probs * probs).sum() * self.num_experts  # higher when imbalanced
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
+    # ---------------------------------------------------------------------
+    # Forward
+    # ---------------------------------------------------------------------
+    def forward(self, x, k: int = 2):
+        gate_logits = self.gate(x)  # (b, s, E)
+        topk_val, topk_idx = gate_logits.topk(k, dim=-1)  # (b, s, k)
 
-        Args:
-            x: (batch, seq, d_model)
+        # Hard routing mask: 1 for chosen experts, 0 elsewhere
+        mask = torch.zeros_like(gate_logits).scatter_(-1, topk_idx, 1.0)
 
-        Returns:
-            y: (batch, seq, d_model)
-            aux_loss: (scalar) load‑balancing loss to add to the main loss
-        """
-        gate_logits = self.gate(x)  # (batch, seq, num_experts)
-        gate_probs = F.softmax(gate_logits, dim=-1)
+        # Softmax only over the chosen experts for normalisation
+        gate_probs = F.softmax(topk_val, dim=-1)  # (b, s, k)
+        gate_probs_full = torch.zeros_like(gate_logits).scatter_(-1, topk_idx, gate_probs)
 
-        # Track a smoothed utilisation statistic for load‑balancing.
+        # Straight‑through estimator:
+        gate_probs_st = gate_probs_full + (mask - gate_probs_full).detach()
+
+        # Track usage stats
         with torch.no_grad():
-            batch_counts = gate_probs.mean(dim=(0, 1))  # average over tokens
-            self._ema_counts.mul_(self.ema_decay).add_(batch_counts, alpha=1 - self.ema_decay)
+            self._ema_counts.mul_(self.ema_decay).add_(gate_probs_st.mean((0, 1)),
+                                                       alpha=1 - self.ema_decay)
 
-        # Compute expert outputs in parallel then combine.
-        # Stack expert outputs: (num_experts, batch, seq, d_model)
-        expert_outs = torch.stack([expert(x) for expert in self.experts], dim=0)
-        # Weight by gate probabilities and sum across experts.
-        y = torch.einsum("bskE,Ebsd->bskd", gate_probs, expert_outs)
-        aux = self.load_balance_loss()
-        return y, aux
+        expert_outs = torch.stack([expert(x) for expert in self.experts], dim=0)  # (E, b, s, d)
+        y = torch.einsum("bsE,Ebsd->bsd", gate_probs_st, expert_outs)
+
+        return y, self.load_balance_loss()
 
 
 class TransformerBlock(nn.Module):
@@ -142,7 +145,7 @@ class MoETransformerLM(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Tiny usage example
+# Tiny usage example / smoke test
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     torch.manual_seed(0)
@@ -152,16 +155,18 @@ if __name__ == "__main__":
     model = MoETransformerLM(vocab, num_layers=2, num_experts=4).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 
-    # Dummy data: just predict next token in a random sequence.
+    # Dummy data: predict next token in a random sequence.
     B, S = 8, 32
     data = torch.randint(0, vocab, (B, S + 1), device=device)
     inputs, targets = data[:, :-1], data[:, 1:]
 
     logits, aux = model(inputs)
     loss_main = F.cross_entropy(logits.view(-1, vocab), targets.view(-1))
-    loss = loss_main + 0.01 * aux  # small weight on load‑balancing loss
+    loss = loss_main + 0.01 * aux
 
     loss.backward()
     optimizer.step()
 
-    print(f"Training step OK – total loss {loss.item():.4f} (main {loss_main.item():.4f}, aux {aux.item():.4f})")
+    print(
+        f"Training step OK \u2013 total loss {loss.item():.4f} (main {loss_main.item():.4f}, aux {aux.item():.4f})"
+    )

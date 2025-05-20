@@ -1,9 +1,6 @@
-"""Tiny training harness for MoETransformerLM on the streaming `fineweb-edu` dataset.
+"""Tiny training harness for MoETransformerLM on the streaming FineWeb‑EDU dataset.
 
-The goal is **not** to train a state‑of‑the‑art model here – just to give you a
-reproducible, end‑to‑end pipeline you can tweak.
-
-Usage (single‑GPU example):
+Run, for example:
 
 ```bash
 python train_fineweb.py \
@@ -28,7 +25,6 @@ from typing import Iterable, List
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from tqdm.auto import tqdm
 
@@ -39,17 +35,11 @@ from fat_moe import MoETransformerLM  # assumes moe_llm.py is on PYTHONPATH
 # Helpers
 # ---------------------------------------------------------------------------
 
-def stream_tokens(dataset_iter: Iterable[str], tokenizer, seq_len: int) -> Iterable[torch.Tensor]:
-    """Yield contiguous sequences of *seq_len+1* tokens.
-
-    The function packs raw text into a single long sequence of token IDs and
-    then chunks it. No padding is needed and each chunk provides both input and
-    target (next‑token) tokens.
-    """
+def stream_tokens(dataset_iter: Iterable[dict], tokenizer, seq_len: int) -> Iterable[torch.Tensor]:
+    """Yield contiguous sequences of `seq_len+1` tokens for next‑token prediction."""
     buf: List[int] = []
-    token_gen = (tokenizer(t["text"], add_special_tokens=False)["input_ids"] for t in dataset_iter)
-    for toks in token_gen:
-        buf.extend(toks + [tokenizer.eos_token_id])  # ensure separation
+    for sample in dataset_iter:
+        buf.extend(tokenizer(sample["text"], add_special_tokens=False)["input_ids"] + [tokenizer.eos_token_id])
         while len(buf) > seq_len:
             chunk = buf[: seq_len + 1]
             buf = buf[seq_len + 1 :]
@@ -62,6 +52,34 @@ def batcher(token_stream: Iterable[torch.Tensor], batch_size: int) -> Iterable[t
         if not batch:
             break
         yield torch.stack(batch)
+
+
+def top_k_sample(logits: torch.Tensor, k: int = 50, temperature: float = 1.0) -> int:
+    """Return an index sampled from the *top‑k* logits (1‑D tensor)."""
+    logits = logits / temperature
+    values, indices = torch.topk(logits, k)
+    probs = torch.softmax(values, dim=-1)
+    next_idx = torch.multinomial(probs, 1).item()
+    return indices[next_idx].item()
+
+
+def generate(model: MoETransformerLM, tokenizer, prompt: str, max_new_tokens: int = 64, temperature: float = 1.0, top_k: int = 50, device="cpu") -> str:
+    """Greedy/top‑k generator for quick qualitative checks."""
+    model.eval()
+    tokens = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    tokens = tokens[-model.max_seq_len :]
+
+    for _ in range(max_new_tokens):
+        idx = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+        with torch.no_grad():
+            logits, _ = model(idx)
+        next_token_logits = logits[0, -1]
+        next_id = top_k_sample(next_token_logits, k=top_k, temperature=temperature)
+        tokens.append(next_id)
+        if next_id == tokenizer.eos_token_id:
+            break
+
+    return tokenizer.decode(tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +101,11 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Tokenizer – we reuse GPT‑2 for convenience (Byte‑level BPE).
+    # Tokenizer – GPT‑2 byte‑level BPE by default.
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.model_max_length = args.seq_len + 1  # disable the 1024‑token check
+    if hasattr(tokenizer, "deprecation_warnings"):
+        tokenizer.deprecation_warnings["sequence_length_is_longer_than_the_specified_max"] = None
     tokenizer.pad_token = tokenizer.eos_token  # avoid size mismatch
 
     # Model
@@ -97,6 +118,9 @@ def main():
         num_experts=args.num_experts,
         max_seq_len=args.seq_len,
     ).to(device)
+    # Print the total number of model parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model has {total_params} parameters")
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -114,14 +138,17 @@ def main():
         try:
             batch = next(batch_stream).to(device)  # (B, seq_len+1)
         except StopIteration:
-            # Dataset exhausted – restart iterator for another pass.
+            # Restart iterator when exhausted.
             token_stream = stream_tokens(dataset, tokenizer, args.seq_len)
             batch_stream = batcher(token_stream, args.batch_size)
             batch = next(batch_stream).to(device)
 
         inputs, targets = batch[:, :-1], batch[:, 1:]
         logits, aux = model(inputs)
-        loss_main = F.cross_entropy(logits.view(-1, tokenizer.vocab_size), targets.view(-1))
+        loss_main = F.cross_entropy(
+            logits.reshape(-1, tokenizer.vocab_size),  # contiguous flatten
+            targets.reshape(-1),
+        )
         loss = loss_main + 0.01 * aux
 
         optim.zero_grad(set_to_none=True)
@@ -130,6 +157,9 @@ def main():
 
         pbar.set_postfix({"loss": loss_main.item(), "aux": aux.item()})
 
+        # --------------------------------------------------------------
+        # Checkpoint + sampling
+        # --------------------------------------------------------------
         if (step + 1) % 100 == 0 or step == args.steps - 1:
             ckpt_path = args.save_dir / f"step_{step+1}.pt"
             torch.save({
@@ -137,7 +167,22 @@ def main():
                 "opt": optim.state_dict(),
                 "step": step + 1,
             }, ckpt_path)
-            pbar.write(f"Checkpoint saved to {ckpt_path}")
+            pbar.write(f"✅ Checkpoint saved to {ckpt_path}")
+
+            # Quick qualitative sample
+            sample_text = generate(
+                model,
+                tokenizer,
+                prompt=args.sample_prompt,
+                max_new_tokens=args.sample_tokens,
+                temperature=1.0,
+                top_k=50,
+                device=device,
+            )
+            pbar.write("\n" + "-" * 80)
+            pbar.write("Sample:\n" + sample_text)
+            pbar.write("-" * 80 + "\n")
+
 
     print("Training completed.")
 
