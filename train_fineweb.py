@@ -88,6 +88,47 @@ def generate(model: MoETransformerLM, tokenizer, prompt: str, max_new_tokens: in
     return tokenizer.decode(tokens)
 
 
+def short_num(n):
+    n = float(n)
+    millnames = ['', 'k', 'm', 'b', 't', 'q']
+
+    if n == 0:
+        return '0'
+    # Determine the appropriate suffix index
+    millidx = max(0, min(len(millnames) - 1,
+                         int(math.floor(math.log10(abs(n)) / 3))))
+    # Scale the number down by the appropriate power of 1000
+    scaled = n / 10 ** (3 * millidx)
+    # Determine the number of decimal places based on the scaled value
+    if scaled < 10:
+        formatted = f"{scaled:.2f}"
+    elif scaled < 100:
+        formatted = f"{scaled:.1f}"
+    else:
+        formatted = f"{scaled:.0f}"
+    return f"{formatted}{millnames[millidx]}"
+
+
+def evaluate_perplexity(model: MoETransformerLM, token_chunks: List[torch.Tensor], device, vocab_size) -> float:
+    """Compute perplexity on pre‑chunked token blocks.
+
+    Args:
+        token_chunks: list where each element is shape (seq_len+1,)
+    Returns perplexity (float).
+    """
+    model.eval()
+    total_loss, total_tokens = 0.0, 0
+    with torch.no_grad():
+        for chunk in token_chunks:
+            chunk = chunk.to(device)
+            inputs, targets = chunk[:-1].unsqueeze(0), chunk[1:].unsqueeze(0)
+            logits, _ = model(inputs)
+            loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1), reduction="sum")
+            total_loss += loss.item()
+            total_tokens += targets.numel()
+    return math.exp(total_loss / total_tokens)
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -126,6 +167,10 @@ def main():
         num_experts=args.num_experts,
         max_seq_len=args.seq_len,
     ).to(device)
+
+    # Print number of parameters
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model has {short_num(num_params)} parameters")
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -192,3 +237,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

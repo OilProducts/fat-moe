@@ -81,9 +81,18 @@ class TransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(d_model)
         self.moe_ff = MoEFeedForward(d_model, d_ff, num_experts)
         self.dropout = nn.Dropout(dropout)
+        # cache causal mask (non‑persistent so it adjusts to device)
+        self.register_buffer("_causal_mask", torch.empty(0), persistent=False)
+
+    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        if self._causal_mask.shape[:2] != (seq_len, seq_len):
+            mask = torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1)
+            self._causal_mask = mask
+        return self._causal_mask
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self‑attention.
+        # Self‑attention with causal mask
+        mask = self._get_causal_mask(x.size(1), x.device)
         sa_out, _ = self.self_attn(x, x, x, attn_mask=attn_mask, need_weights=False)
         x = x + self.dropout(sa_out)
         x = self.ln1(x)
