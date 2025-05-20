@@ -1,24 +1,30 @@
 """Tiny training harness for MoETransformerLM on the streaming FineWeb‑EDU dataset.
 
-Run, for example:
+Features
+--------
+* Streams dataset (no huge download)
+* Saves checkpoints every *N* steps
+* **New:** generates a sample continuation from a fixed prompt each time it
+  checkpoints, so you can watch the model's progress in real‑time.
 
+Example
+~~~~~~~
 ```bash
 python train_fineweb.py \
-    --model_dim 256 \
-    --num_layers 4 \
-    --num_experts 4 \
-    --seq_len 128 \
-    --batch_size 16 \
-    --lr 3e-4 \
-    --steps 1000
+  --model_dim 256 --num_layers 4 --num_experts 4 \
+  --seq_len 128 --batch_size 16 --steps 1000
 ```
 
-Dependencies:
-  pip install torch datasets transformers tqdm
+Dependencies
+~~~~~~~~~~~~
+``pip install torch datasets transformers tqdm``
 """
+
+from __future__ import annotations
 
 import argparse
 import itertools
+import math
 from pathlib import Path
 from typing import Iterable, List
 
@@ -36,7 +42,7 @@ from fat_moe import MoETransformerLM  # assumes moe_llm.py is on PYTHONPATH
 # ---------------------------------------------------------------------------
 
 def stream_tokens(dataset_iter: Iterable[dict], tokenizer, seq_len: int) -> Iterable[torch.Tensor]:
-    """Yield contiguous sequences of `seq_len+1` tokens for next‑token prediction."""
+    """Pack incoming texts into contiguous `seq_len+1` chunks of token IDs."""
     buf: List[int] = []
     for sample in dataset_iter:
         buf.extend(tokenizer(sample["text"], add_special_tokens=False)["input_ids"] + [tokenizer.eos_token_id])
@@ -96,17 +102,19 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--sample_prompt", type=str, default="The purpose of education is")
+    parser.add_argument("--sample_tokens", type=int, default=60)
     parser.add_argument("--save_dir", type=Path, default=Path("checkpoints"))
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Tokenizer – GPT‑2 byte‑level BPE by default.
+    # Tokenizer ‑ GPT‑2 BPE
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.model_max_length = args.seq_len + 1  # disable the 1024‑token check
+    tokenizer.model_max_length = args.seq_len + 1  # disable GPT‑2 1024‑token warning
     if hasattr(tokenizer, "deprecation_warnings"):
         tokenizer.deprecation_warnings["sequence_length_is_longer_than_the_specified_max"] = None
-    tokenizer.pad_token = tokenizer.eos_token  # avoid size mismatch
+    tokenizer.pad_token = tokenizer.eos_token  # just in case
 
     # Model
     model = MoETransformerLM(
@@ -118,9 +126,6 @@ def main():
         num_experts=args.num_experts,
         max_seq_len=args.seq_len,
     ).to(device)
-    # Print the total number of model parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model has {total_params} parameters")
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -138,7 +143,6 @@ def main():
         try:
             batch = next(batch_stream).to(device)  # (B, seq_len+1)
         except StopIteration:
-            # Restart iterator when exhausted.
             token_stream = stream_tokens(dataset, tokenizer, args.seq_len)
             batch_stream = batcher(token_stream, args.batch_size)
             batch = next(batch_stream).to(device)
@@ -146,7 +150,7 @@ def main():
         inputs, targets = batch[:, :-1], batch[:, 1:]
         logits, aux = model(inputs)
         loss_main = F.cross_entropy(
-            logits.reshape(-1, tokenizer.vocab_size),  # contiguous flatten
+            logits.reshape(-1, tokenizer.vocab_size),
             targets.reshape(-1),
         )
         loss = loss_main + 0.01 * aux
@@ -155,7 +159,7 @@ def main():
         loss.backward()
         optim.step()
 
-        pbar.set_postfix({"loss": loss_main.item(), "aux": aux.item()})
+        pbar.set_postfix({"loss": f"{loss_main.item():.4f}", "aux": f"{aux.item():.4f}"})
 
         # --------------------------------------------------------------
         # Checkpoint + sampling
@@ -183,8 +187,7 @@ def main():
             pbar.write("Sample:\n" + sample_text)
             pbar.write("-" * 80 + "\n")
 
-
-    print("Training completed.")
+    print("🎉 Training completed.")
 
 
 if __name__ == "__main__":
