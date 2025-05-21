@@ -138,38 +138,143 @@ class MoEFeedForward(nn.Module):
         return y, self.load_balance_loss()
 
 
-class TransformerBlock(nn.Module):
-    """A single Transformer block with an MoE feed‑forward layer."""
+class MoESelfAttention(nn.Module):
+    """
+    Multi‑Head Self‑Attention where a small gate chooses the top‑k attention
+    *experts* (each expert is a standard nn.MultiheadAttention).
+    The whole sequence is sent to the selected experts and their
+    outputs are combined with soft weights from the gate.
+    """
 
-    def __init__(self, d_model: int, n_head: int, d_ff: int, num_experts: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        d_model: int,
+        n_head: int,
+        num_experts: int,
+        dropout: float = 0.1,
+        k: int = 2,
+        ema_decay: float = 0.99,
+    ):
+        super().__init__()
+        self.num_experts, self.k = num_experts, k
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.attn_experts = nn.ModuleList(
+            nn.MultiheadAttention(
+                d_model, n_head, dropout=dropout, batch_first=True
+            )
+            for _ in range(num_experts)
+        )
+        self.register_buffer("_ema_counts", torch.zeros(num_experts), persistent=False)
+        self.ema_decay = ema_decay
+        self.dropout = nn.Dropout(dropout)
+
+    # --------- helper identical to FFN load‑balance -----------------
+    def load_balance_loss(self) -> torch.Tensor:
+        probs = self._ema_counts / (self._ema_counts.sum() + 1e-9)
+        return (probs * probs).sum() * self.num_experts
+
+    # ----------------------------------------------------------------
+    def forward(self, x: torch.Tensor, causal_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        x: (B, S, D)
+        causal_mask: (S, S) – pre‑computed float(‑inf) mask you already cache
+
+        Returns
+        -------
+        y          : (B, S, D)  – weighted mixture of expert outputs
+        aux_lb_loss: scalar      – expert‑load‑balancing term
+        """
+        B, S, D = x.shape
+
+        # --- 1. gating ------------------------------------------------
+        gate_logits = self.gate(x)                     # (B,S,E)
+        # Pool over sequence so one routing decision per *example*
+        pooled = gate_logits.mean(dim=1)               # (B,E)
+        scores, indices = pooled.topk(self.k, dim=-1)  # (B,k)
+
+        # record EMA usage (hard assignment)
+        mask_for_ema = F.one_hot(indices, self.num_experts).float().sum(0)  # (E,)
+        with torch.no_grad():
+            self._ema_counts.mul_(self.ema_decay).add_(mask_for_ema / B, alpha=1 - self.ema_decay)
+
+        probs = F.softmax(scores, dim=-1)              # (B,k)
+
+        # --- 2. run selected experts ---------------------------------
+        expert_outs = []
+        # because k is tiny (1–2) this loop is fine
+        for slot in range(self.k):
+            expert_idx = indices[:, slot]              # (B,)
+            # find unique experts in this slot to avoid redundant calls
+            unique = expert_idx.unique()
+            slot_out = torch.zeros_like(x)
+            for e in unique:
+                e_mask = expert_idx == e               # which batch items choose this expert
+                if e_mask.any():
+                    x_e = x[e_mask]                    # gather
+                    # MultiheadAttention expects (N, S, D) queries/keys/values
+                    y_e, _ = self.attn_experts[e](x_e, x_e, x_e, attn_mask=causal_mask)
+                    slot_out[e_mask] = y_e
+            expert_outs.append(slot_out)
+
+        # --- 3. weighted sum & dropout --------------------------------
+        # stack: (k, B, S, D) → (B, k, S, D)
+        stacked = torch.stack(expert_outs, dim=1)
+        weighted = (stacked * probs[:, :, None, None]).sum(dim=1)  # (B,S,D)
+        return self.dropout(weighted), self.load_balance_loss()
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_head: int,
+        d_ff: int,
+        num_ff_experts: int,
+        num_attn_experts: int = 1,   # ← new
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.self_attn = nn.MultiheadAttention(d_model, n_head, dropout=dropout, batch_first=True)
+
+        if num_attn_experts > 1:
+            self.self_attn = MoESelfAttention(
+                d_model, n_head, num_attn_experts, dropout=dropout
+            )
+        else:
+            self.self_attn = nn.MultiheadAttention(
+                d_model, n_head, dropout=dropout, batch_first=True
+            )
+
         self.ln2 = nn.LayerNorm(d_model)
-        self.moe_ff = MoEFeedForward(d_model, d_ff, num_experts)
+        self.moe_ff = MoEFeedForward(d_model, d_ff, num_ff_experts)
         self.dropout = nn.Dropout(dropout)
-        # cache causal mask (non‑persistent so it adjusts to device)
         self.register_buffer("_causal_mask", torch.empty(0), persistent=False)
 
-    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        if self._causal_mask.shape[:2] != (seq_len, seq_len):
-            mask = torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1)
-            self._causal_mask = mask
+    def _get_causal_mask(self, S, device):
+        if self._causal_mask.shape[:2] != (S, S):
+            self._causal_mask = torch.triu(
+                torch.full((S, S), float("-inf"), device=device), 1
+            )
         return self._causal_mask
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self‑attention with causal mask
+    def forward(self, x):
         mask = self._get_causal_mask(x.size(1), x.device)
-        sa_out, _ = self.self_attn(x, x, x, attn_mask=mask, need_weights=False)
+
+        # --- attention ------------------------------------------------
+        if isinstance(self.self_attn, MoESelfAttention):
+            sa_out, aux_attn = self.self_attn(x, mask)
+        else:
+            sa_out, _ = self.self_attn(x, x, x, attn_mask=mask, need_weights=False)
+            aux_attn = 0.0
+
         x = x + self.dropout(sa_out)
         x = self.ln1(x)
 
-        # MoE feed‑forward.
-        ff_out, aux = self.moe_ff(x)
+        # --- ffn -------------------------------------------------------
+        ff_out, aux_ffn = self.moe_ff(x)
         x = x + self.dropout(ff_out)
         x = self.ln2(x)
-        return x, aux
-
+        return x, (aux_attn + aux_ffn)
 
 class MoETransformerLM(nn.Module):
     """A minimal GPT‑style language model with Mixture‑of‑Experts FFNs."""
@@ -182,6 +287,7 @@ class MoETransformerLM(nn.Module):
         num_layers: int = 2,
         d_ff: int = 1024,
         num_experts: int = 4,
+        num_attn_experts: int = 4,
         max_seq_len: int = 256,
         dropout: float = 0.1,
     ):
@@ -189,10 +295,15 @@ class MoETransformerLM(nn.Module):
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.layers = nn.ModuleList(
-            [
-                TransformerBlock(d_model, n_head, d_ff, num_experts, dropout=dropout)
-                for _ in range(num_layers)
-            ]
+            TransformerBlock(
+                d_model,
+                n_head,
+                d_ff,
+                num_ff_experts=num_experts,
+                num_attn_experts=num_attn_experts,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
