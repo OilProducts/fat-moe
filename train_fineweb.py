@@ -138,15 +138,17 @@ def main():
     parser.add_argument("--model_dim", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--num_experts", type=int, default=16)
+    parser.add_argument("--num_attn_experts", type=int, default=16)
     parser.add_argument("--ff_dim", type=int, default=4096)
     parser.add_argument("--seq_len", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--steps", type=int, default=100000)
-    parser.add_argument("--eval_tokens", type=int, default=1024*1024, help="Number of tokens from WikiText‑2 for perplexity")
+    parser.add_argument("--eval_tokens", type=int, default=1024*8, help="Number of tokens from WikiText‑2 for perplexity")
     parser.add_argument("--sample_prompt", type=str, default="The purpose of education is")
     parser.add_argument("--sample_tokens", type=int, default=60)
     parser.add_argument("--save_dir", type=Path, default=Path("checkpoints"))
+
     args = parser.parse_args()
 
     torch.set_float32_matmul_precision("high")
@@ -173,6 +175,7 @@ def main():
         num_layers=args.num_layers,
         d_ff=args.ff_dim,
         num_experts=args.num_experts,
+        num_attn_experts=args.num_attn_experts,
         max_seq_len=args.seq_len,
     ).to(device)
 
@@ -264,6 +267,12 @@ def main():
             pbar.write(f"Perplexity on {len(wt_tokens)*(args.seq_len+1)} WikiText‑2 tokens: {ppl:.2f}")
             pbar.write("-" * 80 + "\n")
             model.train()
+            stats = model.token_statistics()
+            print(
+                f"TOKENS   total={stats['total']:,} | "
+                f"attn={", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats['attn_by_exp'] or []))} | "
+                f"ffn={", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats['ffn_by_exp']))}")
+
 
 
     print("🎉 Training completed.")

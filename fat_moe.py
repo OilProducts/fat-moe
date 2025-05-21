@@ -37,6 +37,10 @@ class MoEFeedForward(nn.Module):
         )
         # Exponential‑moving average of expert usage for load‑balancing.
         self.register_buffer("_ema_counts", torch.zeros(num_experts), persistent=False)
+        self.register_buffer("_token_counts", torch.zeros(num_experts, dtype=torch.long),
+                             persistent=False)   # tokens routed to every expert
+        self.register_buffer("_total_tokens", torch.tensor(0, dtype=torch.long),
+                             persistent=False)   # all tokens that passed the module
         self.ema_decay = 0.99
 
     # ---------------------------------------------------------------------
@@ -68,6 +72,17 @@ class MoEFeedForward(nn.Module):
         # 1. Gating: Get scores and select top-k experts
         gate_logits = self.gate(x)  # (batch_size, seq_len, num_experts)
         topk_expert_scores, topk_expert_indices = gate_logits.topk(k, dim=-1)  # (batch_size, seq_len, k) for both
+
+        with torch.no_grad():
+            B, S = x.shape[:2]
+            self._total_tokens += B * S
+
+            # each example’s whole sequence is sent to `indices[b, slot]`
+            for slot in range(k):
+                exp_ids, exp_freq = topk_expert_indices[:, slot].unique(return_counts=True)
+                # add (#examples · S) for every chosen expert
+                self._token_counts.index_add_(0, exp_ids,
+                                              exp_freq.to(self._token_counts.dtype) * S)
 
         # 2. EMA Update for Load Balancing (based on hard assignments)
         # Create a mask indicating which experts were selected for any token
@@ -164,6 +179,10 @@ class MoESelfAttention(nn.Module):
             )
             for _ in range(num_experts)
         )
+        self.register_buffer("_token_counts", torch.zeros(num_experts, dtype=torch.long),
+                             persistent=False)   # tokens routed to every expert
+        self.register_buffer("_total_tokens", torch.tensor(0, dtype=torch.long),
+                             persistent=False)   # all tokens that passed the module
         self.register_buffer("_ema_counts", torch.zeros(num_experts), persistent=False)
         self.ema_decay = ema_decay
         self.dropout = nn.Dropout(dropout)
@@ -177,11 +196,11 @@ class MoESelfAttention(nn.Module):
     def forward(self, x: torch.Tensor, causal_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         x: (B, S, D)
-        causal_mask: (S, S) – pre‑computed float(‑inf) mask you already cache
+        causal_mask: (S,S) – pre‑computed float(‑inf) mask you already cache
 
         Returns
         -------
-        y          : (B, S, D)  – weighted mixture of expert outputs
+        y          : (B,S,D)  – weighted mixture of expert outputs
         aux_lb_loss: scalar      – expert‑load‑balancing term
         """
         B, S, D = x.shape
@@ -192,8 +211,22 @@ class MoESelfAttention(nn.Module):
         pooled = gate_logits.mean(dim=1)               # (B,E)
         scores, indices = pooled.topk(self.k, dim=-1)  # (B,k)
 
+        # Update cumulative counters
+        with torch.no_grad():
+            B, S = x.shape[:2]
+            self._total_tokens += B * S
+
+            # each example’s whole sequence is sent to `indices[b, slot]`
+            for slot in range(self.k):
+                exp_ids, exp_freq = indices[:, slot].unique(return_counts=True)
+                # add (#examples · S) for every chosen expert
+                self._token_counts.index_add_(0, exp_ids,
+                                              exp_freq.to(self._token_counts.dtype) * S)
+
+
         # record EMA usage (hard assignment)
-        mask_for_ema = F.one_hot(indices, self.num_experts).float().sum(0)  # (E,)
+        mask_for_ema = F.one_hot(indices.reshape(-1), self.num_experts) \
+            .float().sum(0)
         with torch.no_grad():
             self._ema_counts.mul_(self.ema_decay).add_(mask_for_ema / B, alpha=1 - self.ema_decay)
 
@@ -276,6 +309,15 @@ class TransformerBlock(nn.Module):
         x = self.ln2(x)
         return x, (aux_attn + aux_ffn)
 
+    def expert_token_stats(self):
+        stats = {}
+        if isinstance(self.self_attn, MoESelfAttention):
+            stats["attn_total"] = int(self.self_attn._total_tokens)
+            stats["attn_by_exp"] = self.self_attn._token_counts.cpu().tolist()
+        stats["ffn_total"] = int(self.moe_ff._total_tokens)
+        stats["ffn_by_exp"] = self.moe_ff._token_counts.cpu().tolist()
+        return stats
+
 class MoETransformerLM(nn.Module):
     """A minimal GPT‑style language model with Mixture‑of‑Experts FFNs."""
 
@@ -329,6 +371,24 @@ class MoETransformerLM(nn.Module):
         x = self.ln_f(x)
         logits = self.head(x)
         return logits, aux_losses
+
+    def token_statistics(self) -> dict:
+        out = dict(total=0, attn_by_exp=None, ffn_by_exp=None)
+        for blk in self.layers:
+            s = blk.expert_token_stats()
+            out["total"] += s.get("attn_total", 0) + s["ffn_total"]
+
+            # first layer defines list length – afterwards element‑wise sum
+            def _merge(key, src):
+                if src is None: return
+                if out[key] is None:
+                    out[key] = src.copy()
+                else:
+                    for i, v in enumerate(src):
+                        out[key][i] += v
+            _merge("attn_by_exp", s.get("attn_by_exp"))
+            _merge("ffn_by_exp",  s["ffn_by_exp"])
+        return out
 
 
 # -----------------------------------------------------------------------------
