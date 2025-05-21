@@ -242,13 +242,15 @@ def main():
         # Checkpoint + sampling
         # --------------------------------------------------------------
         if (step + 1) % 100 == 0 or step == args.steps - 1:
-            ckpt_path = args.save_dir / f"step_{step+1}.pt"
-            torch.save({
-                "model": model.state_dict(),
-                "opt": optim.state_dict(),
-                "step": step + 1,
-            }, ckpt_path)
-            pbar.write(f"✅ Checkpoint saved to {ckpt_path}")
+            if (step +  1) % 1000 == 0:
+                pbar.write(f"Saving checkpoint at step {step+1}…")
+                ckpt_path = args.save_dir / f"step_{step+1}.pt"
+                torch.save({
+                    "model": model.state_dict(),
+                    "opt": optim.state_dict(),
+                    "step": step + 1,
+                }, ckpt_path)
+                pbar.write(f"✅ Checkpoint saved to {ckpt_path}")
 
             # Quick qualitative sample
             model.eval()
