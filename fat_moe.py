@@ -6,18 +6,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class MoEFeedForward(nn.Module):
-    """Minimal Mixture‑of‑Experts feed‑forward module.
 
-    Each token is processed by *all* experts and the outputs are combined
-    with a soft gating weight. This keeps the implementation simple and
-    fully differentiable while still letting you experiment with expert
-    specialization and gating strategies.
+class MoEFeedForward(nn.Module):
+    """Minimal Mixture‑of‑Experts feed‑forward module with top-k routing.
+
+    Each token is routed to and processed by `k` selected experts.
+    The outputs of these `k` experts are combined using learned soft gating
+    weights (probabilities from a softmax over the top-k expert scores).
+    This implementation performs sparse computation, i.e., only selected
+    experts compute for a given token. It includes a load balancing
+    auxiliary loss to encourage expert specialization.
     """
 
     def __init__(self, d_model: int, d_ff: int, num_experts: int):
         super().__init__()
         self.num_experts = num_experts
+        self.d_model = d_model # Store d_model for reshaping output
         # Gating network maps each token to a distribution over experts.
         self.gate = nn.Linear(d_model, num_experts, bias=False)
         # A tiny 2‑layer feed‑forward network per expert.
@@ -40,33 +44,96 @@ class MoEFeedForward(nn.Module):
     # ---------------------------------------------------------------------
     def load_balance_loss(self) -> torch.Tensor:
         """Return a scalar auxiliary loss that penalises expert imbalance."""
+        # Probabilities based on EMA counts (how often each expert was selected)
         probs = self._ema_counts / (self._ema_counts.sum() + 1e-9)
-        return (probs * probs).sum() * self.num_experts  # higher when imbalanced
+        # Loss encourages probabilities to be uniform (1/num_experts)
+        # Higher value means more imbalance. Ranges from 1 (balanced) to num_experts (imbalanced).
+        return (probs * probs).sum() * self.num_experts
 
     # ---------------------------------------------------------------------
     # Forward
     # ---------------------------------------------------------------------
-    def forward(self, x, k: int = 2):
-        gate_logits = self.gate(x)  # (b, s, E)
-        topk_val, topk_idx = gate_logits.topk(k, dim=-1)  # (b, s, k)
+    def forward(self, x: torch.Tensor, k: int = 2) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: input tensor (batch_size, seq_len, d_model)
+            k: number of experts to route each token to
+        Returns:
+            y: output tensor (batch_size, seq_len, d_model)
+            aux_loss: load balancing loss
+        """
+        batch_size, seq_len, _ = x.shape
+        num_tokens = batch_size * seq_len
 
-        # Hard routing mask: 1 for chosen experts, 0 elsewhere
-        mask = torch.zeros_like(gate_logits).scatter_(-1, topk_idx, 1.0)
+        # 1. Gating: Get scores and select top-k experts
+        gate_logits = self.gate(x)  # (batch_size, seq_len, num_experts)
+        topk_expert_scores, topk_expert_indices = gate_logits.topk(k, dim=-1)  # (batch_size, seq_len, k) for both
 
-        # Softmax only over the chosen experts for normalisation
-        gate_probs = F.softmax(topk_val, dim=-1)  # (b, s, k)
-        gate_probs_full = torch.zeros_like(gate_logits).scatter_(-1, topk_idx, gate_probs)
-
-        # Straight‑through estimator:
-        gate_probs_st = gate_probs_full + (mask - gate_probs_full).detach()
-
-        # Track usage stats
+        # 2. EMA Update for Load Balancing (based on hard assignments)
+        # Create a mask indicating which experts were selected for any token
+        # This mask (one-hot representation of topk_expert_indices) is used for load balancing stats
+        mask_for_ema = torch.zeros_like(gate_logits, dtype=torch.float32).scatter_(
+            -1, topk_expert_indices, 1.0
+        ) # (batch_size, seq_len, num_experts)
         with torch.no_grad():
-            self._ema_counts.mul_(self.ema_decay).add_(gate_probs_st.mean((0, 1)),
-                                                       alpha=1 - self.ema_decay)
+            # Calculate mean usage for this batch (fraction of times each expert was selected)
+            # batch_mean_usage will have shape (num_experts,)
+            # The sum of batch_mean_usage will be k, as each token selects k experts.
+            batch_mean_usage = mask_for_ema.mean(dim=(0, 1))
+            self._ema_counts.mul_(self.ema_decay).add_(batch_mean_usage, alpha=1 - self.ema_decay)
 
-        expert_outs = torch.stack([expert(x) for expert in self.experts], dim=0)  # (E, b, s, d)
-        y = torch.einsum("bsE,Ebsd->bsd", gate_probs_st, expert_outs)
+        # 3. Get Gating Probabilities (weights for combining expert outputs)
+        # Softmax over the scores of the selected top-k experts.
+        # These probabilities are used to weight the outputs of the chosen experts.
+        # Gradients will flow through these probabilities to train the gate.
+        gating_probabilities = F.softmax(topk_expert_scores, dim=-1)  # (batch_size, seq_len, k)
+
+        # 4. Sparse Dispatch and Expert Computation
+        # Flatten inputs and routing information for easier processing
+        flat_x = x.reshape(num_tokens, self.d_model)                        # (num_tokens, d_model)
+        flat_topk_expert_indices = topk_expert_indices.reshape(num_tokens, k) # (num_tokens, k)
+        flat_gating_probabilities = gating_probabilities.reshape(num_tokens, k) # (num_tokens, k)
+
+        # Create dispatch tensors:
+        # - `dispatch_expert_indices`: For each of (num_tokens*k) choices, which expert it is (0 to num_experts-1).
+        # - `dispatch_token_indices`: For each of (num_tokens*k) choices, which token it belongs to (0 to num_tokens-1).
+        # - `dispatch_weights`: For each of (num_tokens*k) choices, its gating probability.
+        dispatch_expert_indices = flat_topk_expert_indices.flatten() # Shape: (num_tokens * k)
+        dispatch_token_indices = (
+            torch.arange(num_tokens, device=x.device)
+            .unsqueeze(1)
+            .expand(num_tokens, k)
+            .flatten()
+        ) # Shape: (num_tokens * k)
+        dispatch_weights = flat_gating_probabilities.flatten() # Shape: (num_tokens * k)
+
+        # Initialize the output tensor for flattened tokens
+        y_flat = torch.zeros_like(flat_x) # (num_tokens, d_model)
+
+        # Iterate over each expert, process its assigned tokens, and accumulate weighted outputs
+        for expert_idx in range(self.num_experts):
+            # Find all routing choices that dispatch to the current expert
+            expert_active_mask = (dispatch_expert_indices == expert_idx)
+
+            if expert_active_mask.any(): # If this expert is used for any token choice
+                # Get the original token indices (in flat_x) that need to be processed by this expert
+                tokens_for_this_expert_indices = dispatch_token_indices[expert_active_mask]
+
+                # Get the actual token data for this expert
+                inputs_for_this_expert = flat_x[tokens_for_this_expert_indices] # (num_routed_to_expert, d_model)
+
+                # Get the gating weights for these tokens for this expert
+                weights_for_this_expert = dispatch_weights[expert_active_mask].unsqueeze(1) # (num_routed_to_expert, 1)
+
+                # Compute expert output
+                expert_output = self.experts[expert_idx](inputs_for_this_expert) # (num_routed_to_expert, d_model)
+
+                # Apply weights and add to the corresponding token's output sum using index_add_
+                # index_add_ correctly sums contributions if a token has multiple slots routed to the same expert (though not typical with topk)
+                y_flat.index_add_(0, tokens_for_this_expert_indices, expert_output * weights_for_this_expert)
+
+        # 5. Reshape output to original batch and sequence dimensions
+        y = y_flat.reshape(batch_size, seq_len, self.d_model)
 
         return y, self.load_balance_loss()
 

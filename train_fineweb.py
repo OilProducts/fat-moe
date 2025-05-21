@@ -71,7 +71,6 @@ def top_k_sample(logits: torch.Tensor, k: int = 50, temperature: float = 1.0) ->
 
 def generate(model: MoETransformerLM, tokenizer, prompt: str, max_new_tokens: int = 64, temperature: float = 1.0, top_k: int = 50, device="cpu") -> str:
     """Greedy/top‑k generator for quick qualitative checks."""
-    model.eval()
     tokens = tokenizer(prompt, add_special_tokens=False)["input_ids"]
     tokens = tokens[-model.max_seq_len :]
 
@@ -136,13 +135,14 @@ def evaluate_perplexity(model: MoETransformerLM, token_chunks: List[torch.Tensor
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dim", type=int, default=256)
-    parser.add_argument("--num_layers", type=int, default=2)
-    parser.add_argument("--num_experts", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--num_experts", type=int, default=16)
     parser.add_argument("--ff_dim", type=int, default=1024)
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=100000)
+    parser.add_argument("--eval_tokens", type=int, default=1024*1024, help="Number of tokens from WikiText‑2 for perplexity")
     parser.add_argument("--sample_prompt", type=str, default="The purpose of education is")
     parser.add_argument("--sample_tokens", type=int, default=60)
     parser.add_argument("--save_dir", type=Path, default=Path("checkpoints"))
@@ -168,6 +168,8 @@ def main():
         max_seq_len=args.seq_len,
     ).to(device)
 
+    model = torch.compile(model)
+
     # Print number of parameters
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model has {short_num(num_params)} parameters")
@@ -181,13 +183,30 @@ def main():
     token_stream = stream_tokens(dataset, tokenizer, args.seq_len)
     batch_stream = batcher(token_stream, args.batch_size)
 
+
+    # Evaluation dataset (small slice of WikiText‑2)
+    print("🔍 Preparing WikiText‑2 slice for perplexity eval…")
+    wikitext_iter = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", streaming=True)
+    wt_tokens: List[torch.Tensor] = []
+    for chunk in stream_tokens(wikitext_iter, tokenizer, args.seq_len):
+        wt_tokens.append(chunk)
+        if len(wt_tokens) * (args.seq_len + 1) >= args.eval_tokens:
+            break
+
+
     args.save_dir.mkdir(parents=True, exist_ok=True)
+    epoch_step_count = 0
+    total_epochs_passed = 0  # Optional: to count full passes
 
     pbar = tqdm(range(args.steps), desc="Steps")
     for step in pbar:
+        epoch_step_count += 1
         try:
             batch = next(batch_stream).to(device)  # (B, seq_len+1)
         except StopIteration:
+            pbar.write(f"StopIteration hit after {epoch_step_count} steps in this 'epoch'. Restarting stream.")
+            epoch_step_count = 0
+            total_epochs_passed += 1  # Optional
             token_stream = stream_tokens(dataset, tokenizer, args.seq_len)
             batch_stream = batcher(token_stream, args.batch_size)
             batch = next(batch_stream).to(device)
@@ -219,6 +238,7 @@ def main():
             pbar.write(f"✅ Checkpoint saved to {ckpt_path}")
 
             # Quick qualitative sample
+            model.eval()
             sample_text = generate(
                 model,
                 tokenizer,
@@ -228,8 +248,13 @@ def main():
                 top_k=50,
                 device=device,
             )
+            model.train()
             pbar.write("\n" + "-" * 80)
             pbar.write("Sample:\n" + sample_text)
+            pbar.write("-" * 80 + "\n")
+
+            ppl = evaluate_perplexity(model, wt_tokens, device, tokenizer.vocab_size)
+            pbar.write(f"Perplexity on {len(wt_tokens)*(args.seq_len+1)} WikiText‑2 tokens: {ppl:.2f}")
             pbar.write("-" * 80 + "\n")
 
     print("🎉 Training completed.")
