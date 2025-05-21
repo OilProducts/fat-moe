@@ -160,7 +160,7 @@ class TransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self‑attention with causal mask
         mask = self._get_causal_mask(x.size(1), x.device)
-        sa_out, _ = self.self_attn(x, x, x, attn_mask=attn_mask, need_weights=False)
+        sa_out, _ = self.self_attn(x, x, x, attn_mask=mask, need_weights=False)
         x = x + self.dropout(sa_out)
         x = self.ln1(x)
 

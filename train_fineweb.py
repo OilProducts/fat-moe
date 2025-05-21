@@ -30,6 +30,7 @@ from typing import Iterable, List
 
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from tqdm.auto import tqdm
@@ -134,12 +135,12 @@ def evaluate_perplexity(model: MoETransformerLM, token_chunks: List[torch.Tensor
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dim", type=int, default=256)
+    parser.add_argument("--model_dim", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--num_experts", type=int, default=16)
-    parser.add_argument("--ff_dim", type=int, default=1024)
-    parser.add_argument("--seq_len", type=int, default=128)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--ff_dim", type=int, default=4096)
+    parser.add_argument("--seq_len", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--eval_tokens", type=int, default=1024*1024, help="Number of tokens from WikiText‑2 for perplexity")
@@ -148,7 +149,14 @@ def main():
     parser.add_argument("--save_dir", type=Path, default=Path("checkpoints"))
     args = parser.parse_args()
 
+    torch.set_float32_matmul_precision("high")
+    torch.set_default_dtype(torch.bfloat16)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # scaler = None
+    # if device == "cuda":
+    #     scaler = GradScaler()
 
     # Tokenizer ‑ GPT‑2 BPE
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -168,7 +176,7 @@ def main():
         max_seq_len=args.seq_len,
     ).to(device)
 
-    model = torch.compile(model)
+    # model = torch.compile(model)
 
     # Print number of parameters
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -177,9 +185,9 @@ def main():
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # Streaming FineWeb‑Edu dataset
-    print("Loading FineWeb‑Edu… (streaming mode)")
-    dataset = load_dataset("google/wiki40b", "en", split="train", streaming=True)
-    # dataset = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
+    print("Loading FineWeb‑Edu…")
+    # dataset = load_dataset("google/wiki40b", "en", split="train", streaming=True)
+    dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train")
     token_stream = stream_tokens(dataset, tokenizer, args.seq_len)
     batch_stream = batcher(token_stream, args.batch_size)
 
@@ -223,7 +231,7 @@ def main():
         loss.backward()
         optim.step()
 
-        pbar.set_postfix({"loss": f"{loss_main.item():.4f}", "aux": f"{aux.item():.4f}"})
+        pbar.set_postfix({"loss": f"{loss_main.item():.4f}", "aux": f"{aux.item():.4f}", "epoch": f"{total_epochs_passed}", "steps": f"{epoch_step_count}"})
 
         # --------------------------------------------------------------
         # Checkpoint + sampling
@@ -244,11 +252,10 @@ def main():
                 tokenizer,
                 prompt=args.sample_prompt,
                 max_new_tokens=args.sample_tokens,
-                temperature=1.0,
+                temperature=.2,
                 top_k=50,
                 device=device,
             )
-            model.train()
             pbar.write("\n" + "-" * 80)
             pbar.write("Sample:\n" + sample_text)
             pbar.write("-" * 80 + "\n")
@@ -256,6 +263,8 @@ def main():
             ppl = evaluate_perplexity(model, wt_tokens, device, tokenizer.vocab_size)
             pbar.write(f"Perplexity on {len(wt_tokens)*(args.seq_len+1)} WikiText‑2 tokens: {ppl:.2f}")
             pbar.write("-" * 80 + "\n")
+            model.train()
+
 
     print("🎉 Training completed.")
 
