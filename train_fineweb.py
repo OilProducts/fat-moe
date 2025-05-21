@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import logging
 import math
+import sys
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -37,10 +39,26 @@ from tqdm.auto import tqdm
 
 from fat_moe import MoETransformerLM  # assumes moe_llm.py is on PYTHONPATH
 
+try:
+    from aim import Run  # type: ignore
+except ImportError:  # Degrade gracefully if Aim isn't available
+    Run = None  # type: ignore[misc,assignment]
+
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _setup_logger() -> logging.Logger:
+    fmt = "% (asctime)s | %(levelname)8s | %(message)s"
+    datefmt = "%H:%M:%S"
+    logging.basicConfig(level=logging.INFO, format=fmt, datefmt=datefmt, stream=sys.stdout)
+    logger = logging.getLogger("train")
+    # Remove root handlers added by other libs (datasets transformers etc.) to avoid duplicates
+    logger.addHandler(logging.StreamHandler(sys.stdout))
+    logger.propagate = False
+    return logger
 
 def stream_tokens(dataset_iter: Iterable[dict], tokenizer, seq_len: int) -> Iterable[torch.Tensor]:
     """Pack incoming texts into contiguous `seq_len+1` chunks of token IDs."""
@@ -149,12 +167,22 @@ def main():
     parser.add_argument("--sample_prompt", type=str, default="The purpose of education is")
     parser.add_argument("--sample_tokens", type=int, default=60)
     parser.add_argument("--save_dir", type=Path, default=Path("checkpoints"))
+    parser.add_argument("--log_every", type=int, default=10, help="Logging frequency (in steps)")
+
 
     args = parser.parse_args()
+    logger = _setup_logger()
+
+    aim_run: Optional[Run] = None
+    if Run is not None:
+        aim_run = Run(experiment="fineweb‑moe")
+        aim_run["hparams"] = vars(args)
+        logger.info("Aim tracking enabled ‑ run hash: %s", aim_run.hash)
+    else:
+        logger.warning("Aim is not installed; metrics will not be tracked.")
 
     torch.set_float32_matmul_precision("high")
     torch.set_default_dtype(torch.bfloat16)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # scaler = None
@@ -185,12 +213,12 @@ def main():
 
     # Print number of parameters
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model has {short_num(num_params)} parameters")
+    logger.info("Model has %s parameters", short_num(num_params))
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # Streaming FineWeb‑Edu dataset
-    print("Loading FineWeb‑Edu…")
+    logger.info("Loading FineWeb‑Edu... (this may take a moment on first run)")
     # dataset = load_dataset("google/wiki40b", "en", split="train", streaming=True)
     dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train")
     token_stream = stream_tokens(dataset, tokenizer, args.seq_len)
@@ -198,7 +226,7 @@ def main():
 
 
     # Evaluation dataset (small slice of WikiText‑2)
-    print("🔍 Preparing WikiText‑2 slice for perplexity eval…")
+    logger.info("Preparing WikiText‑2 slice for perplexity eval...")
     wikitext_iter = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", streaming=True)
     wt_tokens: List[torch.Tensor] = []
     for chunk in stream_tokens(wikitext_iter, tokenizer, args.seq_len):
@@ -209,15 +237,17 @@ def main():
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
     epoch_step_count = 0
-    total_epochs_passed = 0  # Optional: to count full passes
+    total_epochs_passed = 0
 
-    pbar = tqdm(range(args.steps), desc="Steps")
-    for step in pbar:
+    # header = f"{'Step':>6s}/{args.steps:<6d} | Loss: {'Loss':>8s} | Aux: {'Aux':>8s} | Epoch: {'Epoch':>5s}"
+    # logger.info(header)
+    # logger.info("‑" * len(header))
+    for step in range(args.steps):
         epoch_step_count += 1
         try:
             batch = next(batch_stream).to(device)  # (B, seq_len+1)
         except StopIteration:
-            pbar.write(f"StopIteration hit after {epoch_step_count} steps in this 'epoch'. Restarting stream.")
+            logger.info("Data iterator exhausted after %d steps; restarting stream.", epoch_step_count)
             epoch_step_count = 0
             total_epochs_passed += 1  # Optional
             token_stream = stream_tokens(dataset, tokenizer, args.seq_len)
@@ -236,48 +266,58 @@ def main():
         loss.backward()
         optim.step()
 
-        pbar.set_postfix({"loss": f"{loss_main.item():.4f}", "aux": f"{aux.item():.4f}", "epoch": f"{total_epochs_passed}", "steps": f"{epoch_step_count}"})
+        if step % args.log_every == 0 or step == args.steps - 1:
+            logger.info(
+                f"Step: {step + 1:6d}/{args.steps:<6d} | Loss: {loss_main.item():8.4f} | Aux: {aux.item():8.4f} | Epoch: {total_epochs_passed:5d}"
+            )
+            stats = model.token_statistics()
+            logger.info(
+                "TOKENS total=%s\nattn=%s\n ffn=%s",
+                f"{stats['total']:,}",
+                ", ".join(f"E{i:02}:{c:9}" for i, c in enumerate(stats.get("attn_by_exp") or [])) or "‑",
+                ", ".join(f"E{i:02}:{c:9}" for i, c in enumerate(stats["ffn_by_exp"]))
+            )
+            if aim_run is not None:
+                aim_run.track(loss_main.item(), name="loss", step=step)
+                aim_run.track(aux.item(), name="aux_loss", step=step)
+
 
         # --------------------------------------------------------------
         # Checkpoint + sampling
         # --------------------------------------------------------------
-        if (step + 1) % 100 == 0 or step == args.steps - 1:
-            if (step +  1) % 1000 == 0:
-                pbar.write(f"Saving checkpoint at step {step+1}…")
-                ckpt_path = args.save_dir / f"step_{step+1}.pt"
-                torch.save({
-                    "model": model.state_dict(),
-                    "opt": optim.state_dict(),
-                    "step": step + 1,
-                }, ckpt_path)
-                pbar.write(f"✅ Checkpoint saved to {ckpt_path}")
+        if (step + 1) % 1000 == 0 or step == args.steps - 1:
+            ckpt_path = args.save_dir / f"step_{step + 1}.pt"
+            torch.save({"model": model.state_dict(), "opt": optim.state_dict(), "step": step + 1}, ckpt_path)
+            logger.info("✅ Checkpoint saved to %s", ckpt_path)
 
-            # Quick qualitative sample
+            # Qualitative sample
             model.eval()
             sample_text = generate(
                 model,
                 tokenizer,
                 prompt=args.sample_prompt,
                 max_new_tokens=args.sample_tokens,
-                temperature=.2,
+                temperature=0.2,
                 top_k=50,
                 device=device,
             )
-            pbar.write("\n" + "-" * 80)
-            pbar.write("Sample:\n" + sample_text)
-            pbar.write("-" * 80 + "\n")
-
-            ppl = evaluate_perplexity(model, wt_tokens, device, tokenizer.vocab_size)
-            pbar.write(f"Perplexity on {len(wt_tokens)*(args.seq_len+1)} WikiText‑2 tokens: {ppl:.2f}")
-            pbar.write("-" * 80 + "\n")
+            logger.info("\n" + "‑" * 80 + "\nSample:\n%s\n%s\n", sample_text, "‑" * 80)
             model.train()
+
+            # Perplexity
+            ppl = evaluate_perplexity(model, wt_tokens, device, tokenizer.vocab_size)
+            logger.info("Perplexity on %d WikiText‑2 tokens: %.2f", len(wt_tokens) * (args.seq_len + 1), ppl)
+            if aim_run is not None:
+                aim_run.track(ppl, name="wikitext_perplexity", step=step)
+
+            # Expert token statistics
             stats = model.token_statistics()
-            print(
-                f"TOKENS   total={stats['total']:,}\n"
-                f"attn={", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats['attn_by_exp'] or []))}\n"
-                f"ffn={", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats['ffn_by_exp']))}")
-
-
+            logger.info(
+                "TOKENS total=%s | attn=%s | ffn=%s",
+                f"{stats['total']:,}",
+                ", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats.get("attn_by_exp") or [])) or "‑",
+                ", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats["ffn_by_exp"]))
+            )
 
     print("🎉 Training completed.")
 
