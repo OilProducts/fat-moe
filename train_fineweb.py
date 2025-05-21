@@ -281,15 +281,7 @@ def main():
                 aim_run.track(loss_main.item(), name="loss", step=step)
                 aim_run.track(aux.item(), name="aux_loss", step=step)
 
-
-        # --------------------------------------------------------------
-        # Checkpoint + sampling
-        # --------------------------------------------------------------
-        if (step + 1) % 1000 == 0 or step == args.steps - 1:
-            ckpt_path = args.save_dir / f"step_{step + 1}.pt"
-            torch.save({"model": model.state_dict(), "opt": optim.state_dict(), "step": step + 1}, ckpt_path)
-            logger.info("✅ Checkpoint saved to %s", ckpt_path)
-
+        if step % 100 == 0:
             # Qualitative sample
             model.eval()
             sample_text = generate(
@@ -310,14 +302,16 @@ def main():
             if aim_run is not None:
                 aim_run.track(ppl, name="wikitext_perplexity", step=step)
 
-            # Expert token statistics
-            stats = model.token_statistics()
-            logger.info(
-                "TOKENS total=%s | attn=%s | ffn=%s",
-                f"{stats['total']:,}",
-                ", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats.get("attn_by_exp") or [])) or "‑",
-                ", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats["ffn_by_exp"]))
-            )
+
+        # --------------------------------------------------------------
+        # Checkpoint + sampling
+        # --------------------------------------------------------------
+        if (step + 1) % 1000 == 0 or step == args.steps - 1:
+            ckpt_path = args.save_dir / f"step_{step + 1}.pt"
+            torch.save({"model": model.state_dict(), "opt": optim.state_dict(), "step": step + 1}, ckpt_path)
+            logger.info("✅ Checkpoint saved to %s", ckpt_path)
+
+
 
     print("🎉 Training completed.")
 
