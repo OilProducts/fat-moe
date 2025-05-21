@@ -326,10 +326,11 @@ class MoETransformerLM(nn.Module):
         vocab_size: int,
         d_model: int = 256,
         n_head: int = 4,
-        num_layers: int = 2,
+        num_layers: int = 1,
         d_ff: int = 1024,
         num_experts: int = 4,
         num_attn_experts: int = 4,
+        layer_repetition: int = 4,
         max_seq_len: int = 256,
         dropout: float = 0.1,
     ):
@@ -347,6 +348,7 @@ class MoETransformerLM(nn.Module):
             )
             for _ in range(num_layers)
         )
+        self.layer_repetition = layer_repetition
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.max_seq_len = max_seq_len
@@ -364,9 +366,11 @@ class MoETransformerLM(nn.Module):
         x = self.token_emb(idx) + self.pos_emb(pos)
 
         aux_losses = 0.0
-        for layer in self.layers:
-            x, aux = layer(x)
-            aux_losses = aux_losses + aux
+        for i in range(self.layer_repetition):
+            for layer in self.layers:
+                x, aux = layer(x)
+                aux_losses = aux_losses + aux
+
 
         x = self.ln_f(x)
         logits = self.head(x)

@@ -136,7 +136,8 @@ def evaluate_perplexity(model: MoETransformerLM, token_chunks: List[torch.Tensor
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dim", type=int, default=512)
-    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=1)
+    parser.add_argument("--layer_repetition", type=int, default=4)
     parser.add_argument("--num_experts", type=int, default=16)
     parser.add_argument("--num_attn_experts", type=int, default=16)
     parser.add_argument("--ff_dim", type=int, default=4096)
@@ -173,6 +174,7 @@ def main():
         d_model=args.model_dim,
         n_head=args.model_dim // 64,
         num_layers=args.num_layers,
+        layer_repetition=args.layer_repetition,
         d_ff=args.ff_dim,
         num_experts=args.num_experts,
         num_attn_experts=args.num_attn_experts,
@@ -269,8 +271,8 @@ def main():
             model.train()
             stats = model.token_statistics()
             print(
-                f"TOKENS   total={stats['total']:,} | "
-                f"attn={", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats['attn_by_exp'] or []))} | "
+                f"TOKENS   total={stats['total']:,}\n"
+                f"attn={", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats['attn_by_exp'] or []))}\n"
                 f"ffn={", ".join(f"E{i}:{c:,}" for i, c in enumerate(stats['ffn_by_exp']))}")
 
 
