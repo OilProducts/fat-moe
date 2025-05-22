@@ -154,11 +154,13 @@ def evaluate_perplexity(model: MoETransformerLM, token_chunks: List[torch.Tensor
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_dim", type=int, default=512)
-    parser.add_argument("--num_layers", type=int, default=1)
+    parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--layer_repetition", type=int, default=4)
-    parser.add_argument("--num_experts", type=int, default=16)
-    parser.add_argument("--num_attn_experts", type=int, default=16)
-    parser.add_argument("--ff_dim", type=int, default=4096)
+    parser.add_argument("--num_experts", type=int, default=8)
+    parser.add_argument("--num_attn_experts", type=int, default=1)
+    parser.add_argument("--top_k", type=int, default=2)
+    parser.add_argument("--ff_dim", type=int, default=2048)
+    parser.add_argument("--num_heads", type=int, default=16)
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -196,16 +198,19 @@ def main():
         tokenizer.deprecation_warnings["sequence_length_is_longer_than_the_specified_max"] = None
     tokenizer.pad_token = tokenizer.eos_token  # just in case
 
+    logger.info("Initializing with args: %s", vars(args))
+
     # Model
     model = MoETransformerLM(
         vocab_size=tokenizer.vocab_size,
         d_model=args.model_dim,
-        n_head=args.model_dim // 64,
+        n_head=args.num_heads,
         num_layers=args.num_layers,
         layer_repetition=args.layer_repetition,
         d_ff=args.ff_dim,
         num_experts=args.num_experts,
         num_attn_experts=args.num_attn_experts,
+        top_k=args.top_k,
         max_seq_len=args.seq_len,
     ).to(device)
 
@@ -213,7 +218,22 @@ def main():
 
     # Print number of parameters
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    layer_params = sum(p.numel() for p in model.layers.parameters() if p.requires_grad)
+    effective_total = (num_params - layer_params) + layer_params * args.layer_repetition
+
+
+    per_expert = sum(p.numel() for p in model.layers[0].moe_ff.experts[0].parameters())
+    active_per_ff = per_expert * (args.num_experts - args.top_k)
+    one_layer = sum(p.numel() for p in model.layers[0].parameters())
+    active_param_layer = (one_layer - (per_expert*args.num_experts)) + per_expert * args.top_k
+    without_layers = num_params - (one_layer * (args.num_layers + 2))  # 2 for initial and final
+    one_tok = (without_layers + (active_param_layer * 2)) # + 2 for initial and final
+    one_tok += (active_param_layer * args.num_layers) * args.layer_repetition
+
+
     logger.info("Model has %s parameters", short_num(num_params))
+    logger.info("Model has %s effective parameters", short_num(effective_total))
+    logger.info("Model has %s active parameters for ONE token (k=%d).", short_num(one_tok), args.top_k)
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -274,8 +294,8 @@ def main():
             logger.info(
                 "TOKENS total=%s\nattn=%s\n ffn=%s",
                 f"{stats['total']:,}",
-                ", ".join(f"E{i:02}:{c:9}" for i, c in enumerate(stats.get("attn_by_exp") or [])) or "‑",
-                ", ".join(f"E{i:02}:{c:9}" for i, c in enumerate(stats["ffn_by_exp"]))
+                ", ".join(f"E{i:02}:{short_num(c):9}" for i, c in enumerate(stats.get("attn_by_exp") or [])) or "‑",
+                ", ".join(f"E{i:02}:{short_num(c):9}" for i, c in enumerate(stats["ffn_by_exp"]))
             )
             if aim_run is not None:
                 aim_run.track(loss_main.item(), name="loss", step=step)

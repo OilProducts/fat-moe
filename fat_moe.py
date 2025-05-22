@@ -256,6 +256,155 @@ class MoESelfAttention(nn.Module):
         return self.dropout(weighted), self.load_balance_loss()
 
 
+class HeadSwitchSelfAttention(nn.Module):
+    """
+    Multi‑Head Self‑Attention where *each head* has `num_experts`
+    value/output projections.
+    For every token we pick the Top‑k experts **independently per head**.
+    The expensive QK soft‑max is done **once**; only the much cheaper
+    V‑proj & out‑proj are routed.
+
+    Parameters
+    ----------
+    d_model      : hidden size
+    n_head       : number of logical heads (h)
+    num_experts  : experts per head (E)
+    k            : top‑k experts to activate **per head**  (usually 1)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_head: int,
+        num_experts: int,
+        k: int = 1,
+        dropout: float = 0.1,
+        ema_decay: float = 0.99,
+    ):
+        super().__init__()
+        assert d_model % n_head == 0
+        self.h = n_head
+        self.d_h = d_model // n_head
+        self.E = num_experts
+        self.k = k
+
+        # shared Q,K projections and bias‑less gate
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+
+        # ------------------------------------------------------------------
+        # Each *head* owns a [E × d_h × d_h] tensor of V and O weights
+        # They are registered as Parameters so they are sharded correctly.
+        # Shape: (h, E, d_h, d_h)
+        self.W_v = nn.Parameter(torch.empty(n_head, num_experts, self.d_h, self.d_h))
+        self.W_o = nn.Parameter(torch.empty(n_head, num_experts, self.d_h, self.d_h))
+        nn.init.xavier_uniform_(self.W_v)
+        nn.init.xavier_uniform_(self.W_o)
+
+        # Gating: per head, per token  –  logits (B,S,h,E)
+        self.router = nn.Linear(d_model, n_head * num_experts, bias=False)
+
+        # Stats for load‑balancing
+        self.register_buffer("_ema_counts", torch.zeros(n_head, num_experts))
+        self.ema_decay = ema_decay
+        self.dropout = nn.Dropout(dropout)
+
+    # ------------- optional auxiliary loss ------------------------------
+    def load_balance_loss(self):
+        probs = self._ema_counts / (self._ema_counts.sum() + 1e-9)
+        return (probs * probs).sum() * self.E * self.h
+    # --------------------------------------------------------------------
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        x    : (B, S, D)
+        mask : (S, S) additive – already ‑inf where causal
+        """
+        B, S, D = x.shape
+        # ---- 1. shared Q, K, attention weights -------------------------
+        q = self.W_q(x).view(B, S, self.h, self.d_h).transpose(1, 2)   # (B,h,S,d_h)
+        k = self.W_k(x).view(B, S, self.h, self.d_h).transpose(1, 2)   # (B,h,S,d_h)
+
+        attn_scores = torch.einsum("bhsd,bhtd->bhst", q, k) / math.sqrt(self.d_h)
+        attn_scores = attn_scores + mask        # broadcast over batch/h
+        p_attn = F.softmax(attn_scores, dim=-1)  # (B,h,S,S)
+
+        # ---- 2. router decides V/O expert per head ---------------------
+        gate_logits = self.router(x)                       # (B,S,h*E)
+        gate_logits = gate_logits.view(B, S, self.h, self.E)
+        topk_scores, topk_idx = gate_logits.topk(self.k, dim=-1)   # (B,S,h,k)
+
+        # soft probabilities for mixture‑of‑experts
+        probs = F.softmax(topk_scores, dim=-1)             # (B,S,h,k)
+
+        # track EMA of choices   (hard, per head)
+        # topk_idx : (B, S, h, k)
+        with torch.no_grad():
+            # one‑hot encode *without* flattening the head dim
+            # shape → (B, S, h, k, E)
+            oh = F.one_hot(topk_idx, num_classes=self.E).float()
+
+            # sum over batch, sequence, and k slots, keep (h,E)
+            hard_counts = oh.sum(dim=(0, 1, 3))  # (h, E)
+
+            # exponential moving average
+            denom = B * S * self.k  # tokens that cast a vote
+            self._ema_counts.mul_(self.ema_decay) \
+                .add_(hard_counts / denom,
+                      alpha=1.0 - self.ema_decay)
+
+        # ---- 3. compute expert V/O projections only for chosen experts -
+        # Pre‑compute x reshaped once to (B,S,h,d_h) for all heads
+        x_h = x.view(B, S, self.h, self.d_h)
+
+        v_out = torch.zeros_like(x_h)     # (B,S,h,d_h)
+        o_out = torch.zeros_like(x_h)
+
+        # loop over k (tiny, usually 1)
+        for slot in range(self.k):
+            idx_e = topk_idx[..., slot]         # (B,S,h)
+            p_e   = probs[..., slot]            # (B,S,h)
+
+            # idx_e : (B, S, h)   →  (h, B, S)
+            idx_e_perm = idx_e.permute(2, 0, 1)  # reorder so head is leading
+
+            # head indices 0..h‑1, one per plane, broadcast across B and S
+            head_idx = torch.arange(self.h, device=idx_e.device) \
+                .view(self.h, 1, 1).expand(self.h, B, S)  # (h, B, S)
+
+            # Now the two indexing tensors have identical shape → OK
+            W_v_e = self.W_v[head_idx, idx_e_perm]  # (h, B, S, d_h, d_h)
+            W_o_e = self.W_o[head_idx, idx_e_perm]  # same shape
+
+            # move head to batch dim for matmul: (h*B*S, d_h)
+            tokens = x_h.permute(2,0,1,3).reshape(-1, self.d_h)       # (h*B*S, d_h)
+            v_proj = torch.bmm(tokens.unsqueeze(1),                  # (h*B*S,1,d_h)
+                               W_v_e.reshape(-1, self.d_h, self.d_h))\
+                            .squeeze(1).view(self.h, B, S, self.d_h)   # back to (h,B,S,d_h)
+
+            # attention aggregation (uses shared weights)
+            attn_out = torch.einsum("bhst,hbsd->hbt d", p_attn, v_proj)  # (h,B,S,d_h)
+
+            # output projection
+            o_proj = torch.bmm(attn_out.reshape(-1,1,self.d_h),
+                               W_o_e.reshape(-1,self.d_h,self.d_h))\
+                            .squeeze(1).view(self.h,B,S,self.d_h)
+
+            # p_e : (B, S, h)
+            weight = p_e.unsqueeze(-1)  # → (B, S, h, 1)   ✔ aligns with B,S,h
+
+            v_out += (attn_out.permute(1, 2, 0, 3) * weight) \
+                .permute(2, 0, 1, 3)  # back to (h, B, S, d_h)
+
+            o_out += (o_proj.permute(1, 2, 0, 3) * weight) \
+                .permute(2, 0, 1, 3)
+
+        # ---- 4. put heads back together, dropout -----------------------
+        y = o_out.permute(1,2,0,3).reshape(B, S, D)
+        return self.dropout(y), self.load_balance_loss()
+
+
+
 class TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -264,13 +413,14 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         num_ff_experts: int,
         num_attn_experts: int = 1,   # ← new
+        top_k: int = 2,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
 
         if num_attn_experts > 1:
-            self.self_attn = MoESelfAttention(
+            self.self_attn = HeadSwitchSelfAttention(
                 d_model, n_head, num_attn_experts, dropout=dropout
             )
         else:
@@ -282,6 +432,7 @@ class TransformerBlock(nn.Module):
         self.moe_ff = MoEFeedForward(d_model, d_ff, num_ff_experts)
         self.dropout = nn.Dropout(dropout)
         self.register_buffer("_causal_mask", torch.empty(0), persistent=False)
+        self.top_k = top_k
 
     def _get_causal_mask(self, S, device):
         if self._causal_mask.shape[:2] != (S, S):
@@ -294,17 +445,18 @@ class TransformerBlock(nn.Module):
         mask = self._get_causal_mask(x.size(1), x.device)
 
         # --- attention ------------------------------------------------
-        if isinstance(self.self_attn, MoESelfAttention):
-            sa_out, aux_attn = self.self_attn(x, mask)
-        else:
+        if isinstance(self.self_attn, nn.MultiheadAttention):
             sa_out, _ = self.self_attn(x, x, x, attn_mask=mask, need_weights=False)
             aux_attn = 0.0
+        else:
+            sa_out, aux_attn = self.self_attn(x, mask)
+
 
         x = x + self.dropout(sa_out)
         x = self.ln1(x)
 
         # --- ffn -------------------------------------------------------
-        ff_out, aux_ffn = self.moe_ff(x)
+        ff_out, aux_ffn = self.moe_ff(x, k=self.top_k)
         x = x + self.dropout(ff_out)
         x = self.ln2(x)
         return x, (aux_attn + aux_ffn)
@@ -330,6 +482,7 @@ class MoETransformerLM(nn.Module):
         d_ff: int = 1024,
         num_experts: int = 4,
         num_attn_experts: int = 4,
+        top_k: int = 2,
         layer_repetition: int = 4,
         max_seq_len: int = 256,
         dropout: float = 0.1,
@@ -337,6 +490,10 @@ class MoETransformerLM(nn.Module):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.initial_layer = TransformerBlock(d_model, n_head, d_ff,
+                                              num_ff_experts=num_experts,
+                                              num_attn_experts=num_attn_experts,
+                                              dropout=dropout)
         self.layers = nn.ModuleList(
             TransformerBlock(
                 d_model,
@@ -348,6 +505,10 @@ class MoETransformerLM(nn.Module):
             )
             for _ in range(num_layers)
         )
+        self.final_layer = TransformerBlock(d_model, n_head, d_ff,
+                                            num_ff_experts=num_experts,
+                                            num_attn_experts=num_attn_experts,
+                                            dropout=dropout)
         self.layer_repetition = layer_repetition
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
