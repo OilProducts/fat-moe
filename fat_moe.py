@@ -17,13 +17,7 @@ class RepeatEmbedding(nn.Module):
 
 class MoEFeedForward(nn.Module):
     """Minimal Mixture‑of‑Experts feed‑forward module with top-k routing.
-
-    Each token is routed to and processed by `k` selected experts.
-    The outputs of these `k` experts are combined using learned soft gating
-    weights (probabilities from a softmax over the top-k expert scores).
-    This implementation performs sparse computation, i.e., only selected
-    experts compute for a given token. It includes a load balancing
-    auxiliary loss to encourage expert specialization.
+    (Docstring as before)
     """
 
     def __init__(self,
@@ -34,12 +28,11 @@ class MoEFeedForward(nn.Module):
                  capacity_factor: float = 1.25):
         super().__init__()
         self.num_experts = num_experts
-        self.d_model = d_model  # Store d_model for reshaping output
+        self.d_model = d_model
         self.noise_std = noise_std
         self.capacity_factor = capacity_factor
-        # Gating network maps each token to a distribution over experts.
+
         self.gate = nn.Linear(d_model, num_experts, bias=False)
-        # A tiny 2‑layer feed‑forward network per expert.
         self.experts = nn.ModuleList(
             [
                 nn.Sequential(
@@ -50,11 +43,27 @@ class MoEFeedForward(nn.Module):
                 for _ in range(num_experts)
             ]
         )
-        # Exponential‑moving average of expert usage for load‑balancing.
-        self.register_buffer("_ema_counts", torch.zeros(num_experts), persistent=False)
-        self.register_buffer("_token_counts", torch.zeros(num_experts, dtype=torch.float32))
-        self.register_buffer("_total_tokens", torch.tensor(0, dtype=torch.long),
-                             persistent=False)  # all tokens that passed the module
+
+        # --- Cumulative Statistic Buffers ---
+        # 1. Total tokens that entered the layer (B*S)
+        self.register_buffer("_total_tokens",
+                             torch.tensor(0, dtype=torch.long),
+                             persistent=False)
+
+        # 2. Cumulative tokens ACTUALLY ROUTED to each expert (post-capacity)
+        # This will be used by your expert_token_stats for 'ffn_by_exp'
+        self.register_buffer("_token_counts",  # Renaming for clarity based on usage
+                             torch.zeros(num_experts, dtype=torch.float32),
+                             persistent=False)
+
+        # 3. Cumulative tokens SELECTED BY THE GATE for each expert (pre-capacity)
+        # Useful for observing gate's raw preferences and calculating "diff"
+        self.register_buffer("_gate_selection_counts",
+                             torch.zeros(num_experts, dtype=torch.float32),
+                             persistent=False)
+
+        # --- EMA Statistic Buffer (Post-Capacity) ---
+        # EMA of sum of gating probabilities for tokens dispatched to each expert.
         self.register_buffer("_ema_importance",
                              torch.zeros(num_experts, dtype=torch.float32),
                              persistent=False)
@@ -65,91 +74,123 @@ class MoEFeedForward(nn.Module):
     # Public helpers
     # ---------------------------------------------------------------------
     def load_balance_loss(self) -> torch.Tensor:
-        """Return a scalar auxiliary loss that penalises expert imbalance."""
-        # Probabilities based on EMA counts (how often each expert was selected)
-        probs = self._ema_counts / (self._ema_counts.sum() + 1e-9)
-        # Loss encourages probabilities to be uniform (1/num_experts)
-        # Higher value means more imbalance. Ranges from 1 (balanced) to num_experts (imbalanced).
-        return (probs * probs).sum() * self.num_experts
+        """
+        Return a scalar auxiliary loss penalising expert imbalance based on
+        cumulative historical counts of ACTUALLY ROUTED tokens (post-capacity).
+        """
+        # self._token_counts now refers to actual dispatch counts (post-capacity)
+        if self._token_counts.sum() == 0:  # Avoid division by zero
+            return torch.tensor(0.0, device=self._token_counts.device)
+
+        # probs_actual_dispatch: historical probability of an expert actually processing a token
+        probs_actual_dispatch = self._token_counts / (self._token_counts.sum() + 1e-9)
+        return (probs_actual_dispatch * probs_actual_dispatch).sum() * self.num_experts
 
     # ---------------------------------------------------------------------
     # Forward
     # ---------------------------------------------------------------------
-    def forward(self, x: torch.Tensor, k: int=2) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns
-        -------
-        y        : (B, S, d_model) – model output
-        aux_loss : ()              – scalar load‑balancing loss
-        """
+    def forward(self, x: torch.Tensor, k: int = 2) -> tuple[torch.Tensor, torch.Tensor]:
         B, S, _ = x.shape
         E = self.num_experts
+        num_tokens_total_batch = B * S
 
-        # ------------------------------------------------ 1.  Gate logits
-        gate_logits = self.gate(x)  # (B,S,E)
+        # --- Update total input tokens ---
+        with torch.no_grad():
+            self._total_tokens += num_tokens_total_batch
+
+        # ------------------------------------------------ 1. Gate logits & Top-k Selection
+        gate_logits = self.gate(x)
         if self.training and self.noise_std > 0.0:
             gate_logits = gate_logits + torch.randn_like(gate_logits) * self.noise_std
 
-        topk_scores, topk_idx = gate_logits.topk(k, dim=-1)  # (B,S,k)
-        probs = torch.softmax(topk_scores, dim=-1)  # (B,S,k)
+        topk_scores, topk_idx = gate_logits.topk(k, dim=-1)  # topk_idx shape: (B,S,k)
+        probs = torch.softmax(topk_scores, dim=-1)
 
-        # ------------------------------------------------ 2.  Soft‑capacity mask
-        capacity = math.ceil(self.capacity_factor * (B * S) / E)
+        # ------------------------------------------------ 1.5 Update Gate Selection Counts (Pre-Capacity)
+        with torch.no_grad():
+            for slot_idx in range(k):
+                choices_for_slot = topk_idx[:, :, slot_idx].flatten()
+                expert_ids_in_slot, freq_in_slot = choices_for_slot.unique(return_counts=True)
+                self._gate_selection_counts.index_add_(
+                    0, expert_ids_in_slot, freq_in_slot.to(self._gate_selection_counts.dtype)
+                )
 
-        flat_idx = topk_idx.reshape(-1)  # (T,)  T=B·S·k
-        one_hot = F.one_hot(flat_idx, E).float()  # (T,E)
-        tokens_so_far = one_hot.cumsum(0)  # (T,E)
-        flat_keep = (tokens_so_far <= capacity).gather(
-            1, flat_idx.unsqueeze(1)
-        ).squeeze(1)  # (T,)
-        keep_mask = flat_keep.view(B, S, k)  # (B,S,k)
+        # ------------------------------------------------ 2. Soft‑capacity mask
+        # (Logic for capacity, keep_mask, and re-normalizing probs remains the same)
+        capacity = math.ceil(self.capacity_factor * num_tokens_total_batch / E)
+        flat_topk_idx = topk_idx.reshape(-1)
+        one_hot_dispatch = F.one_hot(flat_topk_idx, num_classes=E).float()
+        tokens_per_expert_cumulative = one_hot_dispatch.cumsum(dim=0)
+        capacity_check = tokens_per_expert_cumulative <= capacity
+        flat_keep_mask_for_slot = capacity_check.gather(1, flat_topk_idx.unsqueeze(1)).squeeze(1)
+        keep_mask = flat_keep_mask_for_slot.view(B, S, k)
 
         probs = probs * keep_mask
-        probs = probs / (probs.sum(-1, keepdim=True) + 1e-9)  # renormalise
+        probs_sum = probs.sum(dim=-1, keepdim=True)
+        probs = probs / (probs_sum + 1e-9)
 
-        # ------------------------------------------------ 3.  Dispatch tensors
-        T = B * S * k
-        flat_probs = probs.reshape(T)
-        nonzero = flat_probs > 0
+        # ------------------------------------------------ 3. Dispatch tensors
+        # (Logic for dispatch_tokens_global_idx, dispatch_experts_idx, dispatch_weights remains the same)
+        flat_probs = probs.reshape(-1)
+        nonzero_dispatch_mask = flat_probs > 0
+        original_token_indices = torch.arange(num_tokens_total_batch, device=x.device)
+        dispatch_tokens_global_idx = original_token_indices.repeat_interleave(k)[
+            nonzero_dispatch_mask]
+        dispatch_experts_idx = flat_topk_idx[
+            nonzero_dispatch_mask]  # Expert indices for dispatched tokens
+        dispatch_weights = flat_probs[nonzero_dispatch_mask]
 
-        dispatch_tokens = torch.arange(B * S, device=x.device).repeat_interleave(k)[nonzero]
-        dispatch_experts = flat_idx[nonzero]
-        dispatch_weights = flat_probs[nonzero]
+        x_flat = x.reshape(num_tokens_total_batch, self.d_model)
+        x_dispatch_input = x_flat[dispatch_tokens_global_idx]
 
-        x_flat = x.reshape(B * S, -1)
-        x_sel = x_flat[dispatch_tokens] * dispatch_weights.unsqueeze(1)
-
-        # ------------------------------------------------ 4.  Expert execution
+        # ------------------------------------------------ 4. Expert execution
+        # (Logic remains the same)
         y_flat = torch.zeros_like(x_flat)
-        for e in range(E):
-            mask_e = dispatch_experts == e
-            if mask_e.any():
-                out_e = self.experts[e](x_sel[mask_e])
-                y_flat[dispatch_tokens[mask_e]] += out_e
+        for e_idx in range(E):
+            expert_mask = (dispatch_experts_idx == e_idx)
+            if expert_mask.any():
+                tokens_for_expert_e = x_dispatch_input[expert_mask]
+                weights_for_expert_e = dispatch_weights[expert_mask].unsqueeze(1)
+                expert_output_e = self.experts[e_idx](tokens_for_expert_e)
+                global_indices_for_expert_e = dispatch_tokens_global_idx[expert_mask]
+                y_flat.index_add_(0, global_indices_for_expert_e,
+                                  weights_for_expert_e * expert_output_e)
+        y = y_flat.view(B, S, self.d_model)
 
-        y = y_flat.view(B, S, -1)
+        # ------------------------------------------------ 5. Batch/EMA Statistics (Post-Capacity) + Switch Aux Loss
+        # Count of tokens ACTUALLY ROUTED to each expert in this batch
+        batch_tokens_actually_routed_per_expert = torch.bincount(
+            dispatch_experts_idx, minlength=E
+        ).float()
 
-        # ------------------------------------------------ 5.  EMA statistics + aux loss
-        # token‑count per expert
-        token_ctr = torch.bincount(dispatch_experts, minlength=E).float()  # (E,)
-        # importance = sum of gate probabilities per expert
-        imp_ctr = torch.zeros(E, device=x.device).index_add_(
-            0, dispatch_experts, dispatch_weights
+        # Sum of gating probabilities for tokens ACTUALLY ROUTED in this batch
+        batch_importance_sum_per_expert = torch.zeros(E, device=x.device, dtype=x.dtype)
+        batch_importance_sum_per_expert.index_add_(0, dispatch_experts_idx, dispatch_weights)
+
+        # --- Update Cumulative Actual Dispatch Counts (Post-Capacity) ---
+        with torch.no_grad():
+            # self._token_counts is for 'ffn_by_exp' -> actual routed tokens
+            self._token_counts += batch_tokens_actually_routed_per_expert
+
+        # --- Update EMA for importance (post-capacity) ---
+        self._ema_importance.mul_(self.ema_decay).add_(
+            batch_importance_sum_per_expert, alpha=1 - self.ema_decay
         )
 
-        # if not hasattr(self, "_ema_tokens"):
-        #     self.register_buffer("_ema_tokens", torch.zeros(E))
-        #     self.register_buffer("_ema_importance", torch.zeros(E))
+        # --- Switch-Transformer load‑balancing loss (for training) ---
+        # Based on current batch post-capacity stats
+        tokens_frac_batch = batch_tokens_actually_routed_per_expert / \
+                            (batch_tokens_actually_routed_per_expert.sum() + 1e-9)
+        importance_frac_batch = batch_importance_sum_per_expert / \
+                                (batch_importance_sum_per_expert.sum() + 1e-9)
+        aux_loss_switch = (tokens_frac_batch * importance_frac_batch).sum() * E
 
-        self._token_counts.mul_(self.ema_decay).add_(token_ctr, alpha=1 - self.ema_decay)
-        self._ema_importance.mul_(self.ema_decay).add_(imp_ctr, alpha=1 - self.ema_decay)
+        # --- Choose your auxiliary loss for training ---
+        final_aux_loss = aux_loss_switch  # Default to Switch loss
+        # Example: use historical actual dispatch imbalance
+        # final_aux_loss = self.load_balance_loss()
 
-        # Switch‑Transformer load‑balancing loss
-        tokens_frac = token_ctr / token_ctr.sum()
-        importance_frac = imp_ctr / imp_ctr.sum()
-        aux_loss = (tokens_frac * importance_frac).sum() * E  # scalar
-
-        return y, aux_loss
+        return y, final_aux_loss
 
 
 class MoESelfAttention(nn.Module):
@@ -457,11 +498,24 @@ class TransformerBlock(nn.Module):
 
     def expert_token_stats(self):
         stats = {}
-        if isinstance(self.self_attn, MoESelfAttention):
+
+        # For MoE Self-Attention (if present and provides similar stats)
+        if hasattr(self, 'self_attn') and hasattr(self.self_attn, '_total_tokens'):
+            # Check if self_attn appears to be an MoE layer with the expected attributes
             stats["attn_total"] = int(self.self_attn._total_tokens)
-            stats["attn_by_exp"] = self.self_attn._token_counts.cpu().tolist()
-        stats["ffn_total"] = int(self.moe_ff._total_tokens)
-        stats["ffn_by_exp"] = self.moe_ff._token_counts.cpu().tolist()
+            if hasattr(self.self_attn, '_token_counts'):
+                stats["attn_by_exp"] = self.self_attn._token_counts.cpu().tolist()
+            if hasattr(self.self_attn, '_gate_selection_counts'):
+                stats[
+                    "attn_gate_selection_by_exp"] = self.self_attn._gate_selection_counts.cpu().tolist()
+
+        # For MoE FeedForward layer (self.moe_ff)
+        if hasattr(self, 'moe_ff'):  # Should always exist based on your structure
+            stats["ffn_total"] = int(self.moe_ff._total_tokens)
+            stats["ffn_by_exp"] = self.moe_ff._token_counts.cpu().tolist()  # Actual routed tokens
+            # Add the pre-capacity gate selection counts
+            stats["ffn_gate_selection_by_exp"] = self.moe_ff._gate_selection_counts.cpu().tolist()
+
         return stats
 
 
@@ -558,18 +612,22 @@ class MoETransformerLM(nn.Module):
         -------
         stats : dict
             {
-              "total"          : int,                # real tokens seen by the model
-              "attn_by_exp"    : list[int] | None,   # aggregate across *all* layers
-              "ffn_by_exp"     : list[int],
-              "layers"         : [                   # NEW – one entry per block
+              "total"                          : int,
+              "attn_by_exp"                    : list[int] | None,
+              "attn_gate_selection_by_exp"     : list[int] | None, # NEW
+              "ffn_by_exp"                     : list[int],
+              "ffn_gate_selection_by_exp"      : list[int],        # NEW
+              "layers"         : [
                   {
-                    "name"         : str,            # "init", "L0", "L1", …, "final"
-                    "attn_total"   : int,            # present only if MoE attention
-                    "attn_by_exp"  : list[int] | None,
-                    "ffn_total"    : int,
-                    "ffn_by_exp"   : list[int],
+                    "name"                         : str,
+                    "attn_total"                   : int,
+                    "attn_by_exp"                  : list[int] | None,
+                    "attn_gate_selection_by_exp"   : list[int] | None, # NEW
+                    "ffn_total"                    : int,
+                    "ffn_by_exp"                   : list[int],
+                    "ffn_gate_selection_by_exp"    : list[int],        # NEW
                   },
-                  …
+                  # ...
               ],
             }
         """
@@ -580,7 +638,11 @@ class MoETransformerLM(nn.Module):
             if src is None:
                 return dst
             if dst is None:
-                return src.copy()
+                # Ensure to copy if src is not None, to avoid modifying original list from bstats
+                return list(
+                    src)  # Changed to list(src) for safety, was src.copy() which might fail if not list
+
+            # If dst exists, extend it if necessary and add values
             for i, v in enumerate(src):
                 if i >= len(dst):
                     dst.append(v)
@@ -595,33 +657,55 @@ class MoETransformerLM(nn.Module):
                  [(f"final{i}", blk) for i, blk in enumerate(self.final_layers)]
 
         # True “how many tokens have passed through the model?”
-        true_total = int(self.initial_layers[0].moe_ff._total_tokens)
+        # This assumes _total_tokens in the first layer's FFN MoE represents this.
+        # Ensure this layer exists and has the attribute.
+        true_total = 0
+        if self.initial_layers and hasattr(self.initial_layers[0], 'moe_ff') and \
+                hasattr(self.initial_layers[0].moe_ff, '_total_tokens'):
+            true_total = int(self.initial_layers[0].moe_ff._total_tokens)
 
-        agg_attn, agg_ffn = None, None
-        per_layer: list[dict] = []
+        agg_attn_by_exp, agg_ffn_by_exp = None, None
+        agg_attn_gate_selection, agg_ffn_gate_selection = None, None  # NEW aggregates
+
+        per_layer_stats: list[dict] = []  # Renamed for clarity
 
         for name, blk in blocks:
             bstats = blk.expert_token_stats()  # local stats for this block
 
-            per_layer.append({
+            # Prepare stats for this layer
+            layer_detail = {
                 "name": name,
                 "attn_total": bstats.get("attn_total", 0),
                 "attn_by_exp": bstats.get("attn_by_exp"),
-                "ffn_total": bstats["ffn_total"],
-                "ffn_by_exp": bstats["ffn_by_exp"],
-            })
+                "attn_gate_selection_by_exp": bstats.get("attn_gate_selection_by_exp"),  # NEW
+                "ffn_total": bstats.get("ffn_total", 0),  # Use .get for ffn_total for safety
+                "ffn_by_exp": bstats.get("ffn_by_exp"),  # Use .get for ffn_by_exp
+            }
+            # ffn_gate_selection_by_exp should be present if ffn_by_exp is
+            if "ffn_by_exp" in bstats:  # Check if ffn stats are present
+                layer_detail["ffn_gate_selection_by_exp"] = bstats.get(
+                    "ffn_gate_selection_by_exp")  # NEW
 
-            agg_attn = _merge(agg_attn, bstats.get("attn_by_exp"))
-            agg_ffn = _merge(agg_ffn, bstats["ffn_by_exp"])
+            per_layer_stats.append(layer_detail)
+
+            # Aggregate stats
+            agg_attn_by_exp = _merge(agg_attn_by_exp, bstats.get("attn_by_exp"))
+            agg_ffn_by_exp = _merge(agg_ffn_by_exp, bstats.get("ffn_by_exp"))
+            agg_attn_gate_selection = _merge(agg_attn_gate_selection,
+                                             bstats.get("attn_gate_selection_by_exp"))  # NEW
+            # Ensure ffn_gate_selection_by_exp is merged only if present
+            if "ffn_by_exp" in bstats:  # Condition this on ffn MoE stats being available
+                agg_ffn_gate_selection = _merge(agg_ffn_gate_selection,
+                                                bstats.get("ffn_gate_selection_by_exp"))  # NEW
 
         return {
             "total": true_total,
-            "attn_by_exp": agg_attn,
-            "ffn_by_exp": agg_ffn,
-            "layers": per_layer,
+            "attn_by_exp": agg_attn_by_exp,
+            "attn_gate_selection_by_exp": agg_attn_gate_selection,  # NEW
+            "ffn_by_exp": agg_ffn_by_exp,
+            "ffn_gate_selection_by_exp": agg_ffn_gate_selection,  # NEW
+            "layers": per_layer_stats,
         }
-
-
 # -----------------------------------------------------------------------------
 # Tiny usage example / smoke test
 # -----------------------------------------------------------------------------

@@ -254,14 +254,14 @@ def pack_and_tokenise(batch,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dim", type=int, default=768)
+    parser.add_argument("--model_dim", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=1)
     parser.add_argument("--layer_repetition", type=int, default=1)
     parser.add_argument("--num_experts", type=int, default=4)
     parser.add_argument("--num_attn_experts", type=int, default=1)
     parser.add_argument("--top_k", type=int, default=2)
-    parser.add_argument("--ff_dim", type=int, default=3072)
-    parser.add_argument("--num_heads", type=int, default=12)
+    parser.add_argument("--ff_dim", type=int, default=2048)
+    parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -272,7 +272,7 @@ def main():
     parser.add_argument("--sample_tokens", type=int, default=60)
     parser.add_argument("--save_dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--log_every", type=int, default=10, help="Logging frequency (in steps)")
-    parser.add_argument("--grad_accum", type=int, default=8,
+    parser.add_argument("--grad_accum", type=int, default=2,
                         help="Micro‑batches to accumulate before an optimizer step")
     parser.add_argument("--capacity_factor", type=float, default=1.25)
 
@@ -352,7 +352,7 @@ def main():
         .map(
             pack_and_tokenise,
             batched=True,
-            batch_size=10_000,
+            batch_size=1_000,
             num_proc = int(os.cpu_count()/2),
             fn_kwargs={"tokenizer": tokenizer, "chunk_len": args.seq_len + 1, "eos_id": tokenizer.eos_token_id},
             remove_columns=dataset.column_names)).with_format("torch")
@@ -432,30 +432,111 @@ def main():
             last_tok = tok_seen
             steps_left = args.steps - global_step
             eta_seconds = (steps_left / args.log_every) * interval_time
+
+            # Main training stats
             logger.info(
                 f"Step: {global_step + 1:6d}/{args.steps:<6d} | "
                 f"Loss: {loss_main.item():8.4f} | "
-                f"Aux: {aux.item():8.4f} | "
+                f"Aux: {aux.item():8.4f} | "  # This 'aux' comes from MoEFeedForward.forward()
                 f"tok/s: {short_num(int(tps))} | "
                 f"ETA: {format_duration(eta_seconds)} | "
             )
-            stats = model.token_statistics()
+
+            stats = model.token_statistics()  # This now includes *_gate_selection_by_exp
+
+            # --- Aggregate Token Statistics ---
             logger.info(
-                "TOKENS total=%s | ffn=%s",
-                f"{short_num(stats['total'])}",
-                ", ".join(f"E{i:02}:{short_num(c):9}" for i, c in enumerate(stats["ffn_by_exp"]))
+                "TOKEN STATS (Aggregate): total_model_input=%s",
+                short_num(stats['total'])
             )
 
-            for layer in stats["layers"]:
+            # Aggregate FFN Stats
+            agg_ffn_routed_str = "N/A"
+            if stats.get("ffn_by_exp") is not None:
+                agg_ffn_routed_str = ", ".join(
+                    f"E{i:02}:{short_num(c):>6}" for i, c in enumerate(stats["ffn_by_exp"]))
+
+            agg_ffn_selected_str = "N/A"
+            if stats.get("ffn_gate_selection_by_exp") is not None:
+                agg_ffn_selected_str = ", ".join(f"E{i:02}:{short_num(c):>6}" for i, c in
+                                                 enumerate(stats["ffn_gate_selection_by_exp"]))
+
+            logger.info(
+                f"  FFN Agg: Routed=[{agg_ffn_routed_str}] | SelectedByGate=[{agg_ffn_selected_str}]")
+
+            # Aggregate ATTN Stats (Optional, if you have MoE Attention and want to log it)
+            if stats.get("attn_by_exp") is not None or stats.get(
+                    "attn_gate_selection_by_exp") is not None:
+                agg_attn_routed_str = "N/A"
+                if stats.get("attn_by_exp") is not None:
+                    agg_attn_routed_str = ", ".join(
+                        f"E{i:02}:{short_num(c):>6}" for i, c in enumerate(stats["attn_by_exp"]))
+
+                agg_attn_selected_str = "N/A"
+                if stats.get("attn_gate_selection_by_exp") is not None:
+                    agg_attn_selected_str = ", ".join(f"E{i:02}:{short_num(c):>6}" for i, c in
+                                                      enumerate(
+                                                          stats["attn_gate_selection_by_exp"]))
                 logger.info(
-                    "%s  ffn=%s",
-                    layer["name"].ljust(6),
-                    ", ".join(f"E{i}:{short_num(c):7}" for i, c in enumerate(layer["ffn_by_exp"])),
-                )
+                    f"  ATTN Agg: Routed=[{agg_attn_routed_str}] | SelectedByGate=[{agg_attn_selected_str}]")
+
+            # --- Per-Layer Expert Statistics ---
+            logger.info("-" * 80)  # Separator
+            logger.info(
+                "Per-Layer Expert Statistics (Name | Type | Total Layer In | Routed | Selected by Gate):")
+            for layer_stat in stats[
+                "layers"]:  # Renamed 'layer' to 'layer_stat' to avoid conflict if 'layer' is a variable
+                name_str = layer_stat["name"].ljust(7)
+
+                # FFN Stats for the layer
+                ffn_total_layer = layer_stat.get("ffn_total", 0)
+                ffn_routed_list = layer_stat.get("ffn_by_exp")
+                ffn_selected_list = layer_stat.get("ffn_gate_selection_by_exp")
+
+                if ffn_routed_list is not None or ffn_selected_list is not None:  # Only print if FFN MoE stats exist
+                    ffn_total_str = short_num(ffn_total_layer)
+                    ffn_routed_str = "N/A"
+                    if ffn_routed_list is not None:
+                        ffn_routed_str = "[" + ", ".join(
+                            f"E{i}:{short_num(c):>5}" for i, c in enumerate(ffn_routed_list)) + "]"
+
+                    ffn_selected_str = "N/A"
+                    if ffn_selected_list is not None:
+                        ffn_selected_str = "[" + ", ".join(f"E{i}:{short_num(c):>5}" for i, c in
+                                                           enumerate(ffn_selected_list)) + "]"
+                    logger.info(
+                        f"{name_str} | FFN    | In:{ffn_total_str:>6} | {ffn_routed_str} | {ffn_selected_str}")
+
+                # ATTN Stats for the layer (Optional)
+                attn_total_layer = layer_stat.get("attn_total", 0)
+                attn_routed_list = layer_stat.get("attn_by_exp")
+                attn_selected_list = layer_stat.get("attn_gate_selection_by_exp")
+
+                if attn_routed_list is not None or attn_selected_list is not None:  # Only print if ATTN MoE stats exist
+                    attn_total_str = short_num(attn_total_layer)
+                    attn_routed_str = "N/A"
+                    if attn_routed_list is not None:
+                        attn_routed_str = "[" + ", ".join(
+                            f"E{i}:{short_num(c):>5}" for i, c in enumerate(attn_routed_list)) + "]"
+
+                    attn_selected_str = "N/A"
+                    if attn_selected_list is not None:
+                        attn_selected_str = "[" + ", ".join(f"E{i}:{short_num(c):>5}" for i, c in
+                                                            enumerate(attn_selected_list)) + "]"
+                    logger.info(
+                        f"{name_str} | ATTN   | In:{attn_total_str:>6} | {attn_routed_str} | {attn_selected_str}")
+            logger.info("-" * 80)  # Separator
 
             if aim_run is not None:
                 aim_run.track(loss_main.item(), name="loss", step=global_step)
                 aim_run.track(aux.item(), name="aux_loss", step=global_step)
+                # You could also track aggregated expert stats in Aim if desired:
+                # if stats.get("ffn_by_exp") is not None:
+                #     for i, count in enumerate(stats["ffn_by_exp"]):
+                #         aim_run.track(count, name=f"agg_ffn_routed_exp{i}", step=global_step, context={"type": "expert_routing"})
+                # if stats.get("ffn_gate_selection_by_exp") is not None:
+                #     for i, count in enumerate(stats["ffn_gate_selection_by_exp"]):
+                #         aim_run.track(count, name=f"agg_ffn_selected_exp{i}", step=global_step, context={"type": "expert_routing"})
 
         if global_step % 100 == 0:
             # Qualitative sample
