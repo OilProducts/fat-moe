@@ -6,6 +6,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class RepeatEmbedding(nn.Module):
+    def __init__(self, n_repeats: int, d_model: int):
+        super().__init__()
+        self.emb = nn.Embedding(n_repeats, d_model)
+
+    def forward(self, rep_idx: int, x: torch.Tensor):
+        return x + self.emb.weight[rep_idx]
+
 
 class MoEFeedForward(nn.Module):
     """Minimal Mixture‑of‑Experts feed‑forward module with top-k routing.
@@ -18,10 +26,17 @@ class MoEFeedForward(nn.Module):
     auxiliary loss to encourage expert specialization.
     """
 
-    def __init__(self, d_model: int, d_ff: int, num_experts: int):
+    def __init__(self,
+                 d_model: int,
+                 d_ff: int,
+                 num_experts: int,
+                 noise_std: float = 1.0,
+                 capacity_factor: float = 1.25):
         super().__init__()
         self.num_experts = num_experts
-        self.d_model = d_model # Store d_model for reshaping output
+        self.d_model = d_model  # Store d_model for reshaping output
+        self.noise_std = noise_std
+        self.capacity_factor = capacity_factor
         # Gating network maps each token to a distribution over experts.
         self.gate = nn.Linear(d_model, num_experts, bias=False)
         # A tiny 2‑layer feed‑forward network per expert.
@@ -37,10 +52,13 @@ class MoEFeedForward(nn.Module):
         )
         # Exponential‑moving average of expert usage for load‑balancing.
         self.register_buffer("_ema_counts", torch.zeros(num_experts), persistent=False)
-        self.register_buffer("_token_counts", torch.zeros(num_experts, dtype=torch.long),
-                             persistent=False)   # tokens routed to every expert
+        self.register_buffer("_token_counts", torch.zeros(num_experts, dtype=torch.float32))
         self.register_buffer("_total_tokens", torch.tensor(0, dtype=torch.long),
-                             persistent=False)   # all tokens that passed the module
+                             persistent=False)  # all tokens that passed the module
+        self.register_buffer("_ema_importance",
+                             torch.zeros(num_experts, dtype=torch.float32),
+                             persistent=False)
+
         self.ema_decay = 0.99
 
     # ---------------------------------------------------------------------
@@ -57,100 +75,81 @@ class MoEFeedForward(nn.Module):
     # ---------------------------------------------------------------------
     # Forward
     # ---------------------------------------------------------------------
-    def forward(self, x: torch.Tensor, k: int = 2) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, k: int=2) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:
-            x: input tensor (batch_size, seq_len, d_model)
-            k: number of experts to route each token to
-        Returns:
-            y: output tensor (batch_size, seq_len, d_model)
-            aux_loss: load balancing loss
+        Returns
+        -------
+        y        : (B, S, d_model) – model output
+        aux_loss : ()              – scalar load‑balancing loss
         """
-        batch_size, seq_len, _ = x.shape
-        num_tokens = batch_size * seq_len
+        B, S, _ = x.shape
+        E = self.num_experts
 
-        # 1. Gating: Get scores and select top-k experts
-        gate_logits = self.gate(x)  # (batch_size, seq_len, num_experts)
-        topk_expert_scores, topk_expert_indices = gate_logits.topk(k, dim=-1)  # (batch_size, seq_len, k) for both
+        # ------------------------------------------------ 1.  Gate logits
+        gate_logits = self.gate(x)  # (B,S,E)
+        if self.training and self.noise_std > 0.0:
+            gate_logits = gate_logits + torch.randn_like(gate_logits) * self.noise_std
 
-        with torch.no_grad():
-            B, S = x.shape[:2]
-            self._total_tokens += B * S
+        topk_scores, topk_idx = gate_logits.topk(k, dim=-1)  # (B,S,k)
+        probs = torch.softmax(topk_scores, dim=-1)  # (B,S,k)
 
-            # each example’s whole sequence is sent to `indices[b, slot]`
-            for slot in range(k):
-                exp_ids, exp_freq = topk_expert_indices[:, slot].unique(return_counts=True)
-                # add (#examples · S) for every chosen expert
-                self._token_counts.index_add_(0, exp_ids,
-                                              exp_freq.to(self._token_counts.dtype) * S)
+        # ------------------------------------------------ 2.  Soft‑capacity mask
+        capacity = math.ceil(self.capacity_factor * (B * S) / E)
 
-        # 2. EMA Update for Load Balancing (based on hard assignments)
-        # Create a mask indicating which experts were selected for any token
-        # This mask (one-hot representation of topk_expert_indices) is used for load balancing stats
-        mask_for_ema = torch.zeros_like(gate_logits, dtype=torch.float32).scatter_(
-            -1, topk_expert_indices, 1.0
-        ) # (batch_size, seq_len, num_experts)
-        with torch.no_grad():
-            # Calculate mean usage for this batch (fraction of times each expert was selected)
-            # batch_mean_usage will have shape (num_experts,)
-            # The sum of batch_mean_usage will be k, as each token selects k experts.
-            batch_mean_usage = mask_for_ema.mean(dim=(0, 1))
-            self._ema_counts.mul_(self.ema_decay).add_(batch_mean_usage, alpha=1 - self.ema_decay)
+        flat_idx = topk_idx.reshape(-1)  # (T,)  T=B·S·k
+        one_hot = F.one_hot(flat_idx, E).float()  # (T,E)
+        tokens_so_far = one_hot.cumsum(0)  # (T,E)
+        flat_keep = (tokens_so_far <= capacity).gather(
+            1, flat_idx.unsqueeze(1)
+        ).squeeze(1)  # (T,)
+        keep_mask = flat_keep.view(B, S, k)  # (B,S,k)
 
-        # 3. Get Gating Probabilities (weights for combining expert outputs)
-        # Softmax over the scores of the selected top-k experts.
-        # These probabilities are used to weight the outputs of the chosen experts.
-        # Gradients will flow through these probabilities to train the gate.
-        gating_probabilities = F.softmax(topk_expert_scores, dim=-1)  # (batch_size, seq_len, k)
+        probs = probs * keep_mask
+        probs = probs / (probs.sum(-1, keepdim=True) + 1e-9)  # renormalise
 
-        # 4. Sparse Dispatch and Expert Computation
-        # Flatten inputs and routing information for easier processing
-        flat_x = x.reshape(num_tokens, self.d_model)                        # (num_tokens, d_model)
-        flat_topk_expert_indices = topk_expert_indices.reshape(num_tokens, k) # (num_tokens, k)
-        flat_gating_probabilities = gating_probabilities.reshape(num_tokens, k) # (num_tokens, k)
+        # ------------------------------------------------ 3.  Dispatch tensors
+        T = B * S * k
+        flat_probs = probs.reshape(T)
+        nonzero = flat_probs > 0
 
-        # Create dispatch tensors:
-        # - `dispatch_expert_indices`: For each of (num_tokens*k) choices, which expert it is (0 to num_experts-1).
-        # - `dispatch_token_indices`: For each of (num_tokens*k) choices, which token it belongs to (0 to num_tokens-1).
-        # - `dispatch_weights`: For each of (num_tokens*k) choices, its gating probability.
-        dispatch_expert_indices = flat_topk_expert_indices.flatten() # Shape: (num_tokens * k)
-        dispatch_token_indices = (
-            torch.arange(num_tokens, device=x.device)
-            .unsqueeze(1)
-            .expand(num_tokens, k)
-            .flatten()
-        ) # Shape: (num_tokens * k)
-        dispatch_weights = flat_gating_probabilities.flatten() # Shape: (num_tokens * k)
+        dispatch_tokens = torch.arange(B * S, device=x.device).repeat_interleave(k)[nonzero]
+        dispatch_experts = flat_idx[nonzero]
+        dispatch_weights = flat_probs[nonzero]
 
-        # Initialize the output tensor for flattened tokens
-        y_flat = torch.zeros_like(flat_x) # (num_tokens, d_model)
+        x_flat = x.reshape(B * S, -1)
+        x_sel = x_flat[dispatch_tokens] * dispatch_weights.unsqueeze(1)
 
-        # Iterate over each expert, process its assigned tokens, and accumulate weighted outputs
-        for expert_idx in range(self.num_experts):
-            # Find all routing choices that dispatch to the current expert
-            expert_active_mask = (dispatch_expert_indices == expert_idx)
+        # ------------------------------------------------ 4.  Expert execution
+        y_flat = torch.zeros_like(x_flat)
+        for e in range(E):
+            mask_e = dispatch_experts == e
+            if mask_e.any():
+                out_e = self.experts[e](x_sel[mask_e])
+                y_flat[dispatch_tokens[mask_e]] += out_e
 
-            if expert_active_mask.any(): # If this expert is used for any token choice
-                # Get the original token indices (in flat_x) that need to be processed by this expert
-                tokens_for_this_expert_indices = dispatch_token_indices[expert_active_mask]
+        y = y_flat.view(B, S, -1)
 
-                # Get the actual token data for this expert
-                inputs_for_this_expert = flat_x[tokens_for_this_expert_indices] # (num_routed_to_expert, d_model)
+        # ------------------------------------------------ 5.  EMA statistics + aux loss
+        # token‑count per expert
+        token_ctr = torch.bincount(dispatch_experts, minlength=E).float()  # (E,)
+        # importance = sum of gate probabilities per expert
+        imp_ctr = torch.zeros(E, device=x.device).index_add_(
+            0, dispatch_experts, dispatch_weights
+        )
 
-                # Get the gating weights for these tokens for this expert
-                weights_for_this_expert = dispatch_weights[expert_active_mask].unsqueeze(1) # (num_routed_to_expert, 1)
+        # if not hasattr(self, "_ema_tokens"):
+        #     self.register_buffer("_ema_tokens", torch.zeros(E))
+        #     self.register_buffer("_ema_importance", torch.zeros(E))
 
-                # Compute expert output
-                expert_output = self.experts[expert_idx](inputs_for_this_expert) # (num_routed_to_expert, d_model)
+        self._token_counts.mul_(self.ema_decay).add_(token_ctr, alpha=1 - self.ema_decay)
+        self._ema_importance.mul_(self.ema_decay).add_(imp_ctr, alpha=1 - self.ema_decay)
 
-                # Apply weights and add to the corresponding token's output sum using index_add_
-                # index_add_ correctly sums contributions if a token has multiple slots routed to the same expert (though not typical with topk)
-                y_flat.index_add_(0, tokens_for_this_expert_indices, expert_output * weights_for_this_expert)
+        # Switch‑Transformer load‑balancing loss
+        tokens_frac = token_ctr / token_ctr.sum()
+        importance_frac = imp_ctr / imp_ctr.sum()
+        aux_loss = (tokens_frac * importance_frac).sum() * E  # scalar
 
-        # 5. Reshape output to original batch and sequence dimensions
-        y = y_flat.reshape(batch_size, seq_len, self.d_model)
-
-        return y, self.load_balance_loss()
+        return y, aux_loss
 
 
 class MoESelfAttention(nn.Module):
@@ -162,13 +161,13 @@ class MoESelfAttention(nn.Module):
     """
 
     def __init__(
-        self,
-        d_model: int,
-        n_head: int,
-        num_experts: int,
-        dropout: float = 0.1,
-        k: int = 2,
-        ema_decay: float = 0.99,
+            self,
+            d_model: int,
+            n_head: int,
+            num_experts: int,
+            dropout: float = 0.1,
+            k: int = 2,
+            ema_decay: float = 0.99,
     ):
         super().__init__()
         self.num_experts, self.k = num_experts, k
@@ -180,9 +179,9 @@ class MoESelfAttention(nn.Module):
             for _ in range(num_experts)
         )
         self.register_buffer("_token_counts", torch.zeros(num_experts, dtype=torch.long),
-                             persistent=False)   # tokens routed to every expert
+                             persistent=False)  # tokens routed to every expert
         self.register_buffer("_total_tokens", torch.tensor(0, dtype=torch.long),
-                             persistent=False)   # all tokens that passed the module
+                             persistent=False)  # all tokens that passed the module
         self.register_buffer("_ema_counts", torch.zeros(num_experts), persistent=False)
         self.ema_decay = ema_decay
         self.dropout = nn.Dropout(dropout)
@@ -206,9 +205,9 @@ class MoESelfAttention(nn.Module):
         B, S, D = x.shape
 
         # --- 1. gating ------------------------------------------------
-        gate_logits = self.gate(x)                     # (B,S,E)
+        gate_logits = self.gate(x)  # (B,S,E)
         # Pool over sequence so one routing decision per *example*
-        pooled = gate_logits.mean(dim=1)               # (B,E)
+        pooled = gate_logits.mean(dim=1)  # (B,E)
         scores, indices = pooled.topk(self.k, dim=-1)  # (B,k)
 
         # Update cumulative counters
@@ -223,27 +222,26 @@ class MoESelfAttention(nn.Module):
                 self._token_counts.index_add_(0, exp_ids,
                                               exp_freq.to(self._token_counts.dtype) * S)
 
-
         # record EMA usage (hard assignment)
         mask_for_ema = F.one_hot(indices.reshape(-1), self.num_experts) \
             .float().sum(0)
         with torch.no_grad():
             self._ema_counts.mul_(self.ema_decay).add_(mask_for_ema / B, alpha=1 - self.ema_decay)
 
-        probs = F.softmax(scores, dim=-1)              # (B,k)
+        probs = F.softmax(scores, dim=-1)  # (B,k)
 
         # --- 2. run selected experts ---------------------------------
         expert_outs = []
         # because k is tiny (1–2) this loop is fine
         for slot in range(self.k):
-            expert_idx = indices[:, slot]              # (B,)
+            expert_idx = indices[:, slot]  # (B,)
             # find unique experts in this slot to avoid redundant calls
             unique = expert_idx.unique()
             slot_out = torch.zeros_like(x)
             for e in unique:
-                e_mask = expert_idx == e               # which batch items choose this expert
+                e_mask = expert_idx == e  # which batch items choose this expert
                 if e_mask.any():
-                    x_e = x[e_mask]                    # gather
+                    x_e = x[e_mask]  # gather
                     # MultiheadAttention expects (N, S, D) queries/keys/values
                     y_e, _ = self.attn_experts[e](x_e, x_e, x_e, attn_mask=causal_mask)
                     slot_out[e_mask] = y_e
@@ -273,13 +271,13 @@ class HeadSwitchSelfAttention(nn.Module):
     """
 
     def __init__(
-        self,
-        d_model: int,
-        n_head: int,
-        num_experts: int,
-        k: int = 1,
-        dropout: float = 0.1,
-        ema_decay: float = 0.99,
+            self,
+            d_model: int,
+            n_head: int,
+            num_experts: int,
+            k: int = 1,
+            dropout: float = 0.1,
+            ema_decay: float = 0.99,
     ):
         super().__init__()
         assert d_model % n_head == 0
@@ -313,6 +311,7 @@ class HeadSwitchSelfAttention(nn.Module):
     def load_balance_loss(self):
         probs = self._ema_counts / (self._ema_counts.sum() + 1e-9)
         return (probs * probs).sum() * self.E * self.h
+
     # --------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -322,20 +321,20 @@ class HeadSwitchSelfAttention(nn.Module):
         """
         B, S, D = x.shape
         # ---- 1. shared Q, K, attention weights -------------------------
-        q = self.W_q(x).view(B, S, self.h, self.d_h).transpose(1, 2)   # (B,h,S,d_h)
-        k = self.W_k(x).view(B, S, self.h, self.d_h).transpose(1, 2)   # (B,h,S,d_h)
+        q = self.W_q(x).view(B, S, self.h, self.d_h).transpose(1, 2)  # (B,h,S,d_h)
+        k = self.W_k(x).view(B, S, self.h, self.d_h).transpose(1, 2)  # (B,h,S,d_h)
 
         attn_scores = torch.einsum("bhsd,bhtd->bhst", q, k) / math.sqrt(self.d_h)
-        attn_scores = attn_scores + mask        # broadcast over batch/h
+        attn_scores = attn_scores + mask  # broadcast over batch/h
         p_attn = F.softmax(attn_scores, dim=-1)  # (B,h,S,S)
 
         # ---- 2. router decides V/O expert per head ---------------------
-        gate_logits = self.router(x)                       # (B,S,h*E)
+        gate_logits = self.router(x)  # (B,S,h*E)
         gate_logits = gate_logits.view(B, S, self.h, self.E)
-        topk_scores, topk_idx = gate_logits.topk(self.k, dim=-1)   # (B,S,h,k)
+        topk_scores, topk_idx = gate_logits.topk(self.k, dim=-1)  # (B,S,h,k)
 
         # soft probabilities for mixture‑of‑experts
-        probs = F.softmax(topk_scores, dim=-1)             # (B,S,h,k)
+        probs = F.softmax(topk_scores, dim=-1)  # (B,S,h,k)
 
         # track EMA of choices   (hard, per head)
         # topk_idx : (B, S, h, k)
@@ -357,13 +356,13 @@ class HeadSwitchSelfAttention(nn.Module):
         # Pre‑compute x reshaped once to (B,S,h,d_h) for all heads
         x_h = x.view(B, S, self.h, self.d_h)
 
-        v_out = torch.zeros_like(x_h)     # (B,S,h,d_h)
+        v_out = torch.zeros_like(x_h)  # (B,S,h,d_h)
         o_out = torch.zeros_like(x_h)
 
         # loop over k (tiny, usually 1)
         for slot in range(self.k):
-            idx_e = topk_idx[..., slot]         # (B,S,h)
-            p_e   = probs[..., slot]            # (B,S,h)
+            idx_e = topk_idx[..., slot]  # (B,S,h)
+            p_e = probs[..., slot]  # (B,S,h)
 
             # idx_e : (B, S, h)   →  (h, B, S)
             idx_e_perm = idx_e.permute(2, 0, 1)  # reorder so head is leading
@@ -377,18 +376,18 @@ class HeadSwitchSelfAttention(nn.Module):
             W_o_e = self.W_o[head_idx, idx_e_perm]  # same shape
 
             # move head to batch dim for matmul: (h*B*S, d_h)
-            tokens = x_h.permute(2,0,1,3).reshape(-1, self.d_h)       # (h*B*S, d_h)
-            v_proj = torch.bmm(tokens.unsqueeze(1),                  # (h*B*S,1,d_h)
-                               W_v_e.reshape(-1, self.d_h, self.d_h))\
-                            .squeeze(1).view(self.h, B, S, self.d_h)   # back to (h,B,S,d_h)
+            tokens = x_h.permute(2, 0, 1, 3).reshape(-1, self.d_h)  # (h*B*S, d_h)
+            v_proj = torch.bmm(tokens.unsqueeze(1),  # (h*B*S,1,d_h)
+                               W_v_e.reshape(-1, self.d_h, self.d_h)) \
+                .squeeze(1).view(self.h, B, S, self.d_h)  # back to (h,B,S,d_h)
 
             # attention aggregation (uses shared weights)
             attn_out = torch.einsum("bhst,hbsd->hbt d", p_attn, v_proj)  # (h,B,S,d_h)
 
             # output projection
-            o_proj = torch.bmm(attn_out.reshape(-1,1,self.d_h),
-                               W_o_e.reshape(-1,self.d_h,self.d_h))\
-                            .squeeze(1).view(self.h,B,S,self.d_h)
+            o_proj = torch.bmm(attn_out.reshape(-1, 1, self.d_h),
+                               W_o_e.reshape(-1, self.d_h, self.d_h)) \
+                .squeeze(1).view(self.h, B, S, self.d_h)
 
             # p_e : (B, S, h)
             weight = p_e.unsqueeze(-1)  # → (B, S, h, 1)   ✔ aligns with B,S,h
@@ -400,21 +399,21 @@ class HeadSwitchSelfAttention(nn.Module):
                 .permute(2, 0, 1, 3)
 
         # ---- 4. put heads back together, dropout -----------------------
-        y = o_out.permute(1,2,0,3).reshape(B, S, D)
+        y = o_out.permute(1, 2, 0, 3).reshape(B, S, D)
         return self.dropout(y), self.load_balance_loss()
-
 
 
 class TransformerBlock(nn.Module):
     def __init__(
-        self,
-        d_model: int,
-        n_head: int,
-        d_ff: int,
-        num_ff_experts: int,
-        num_attn_experts: int = 1,   # ← new
-        top_k: int = 2,
-        dropout: float = 0.1,
+            self,
+            d_model: int,
+            n_head: int,
+            d_ff: int,
+            num_ff_experts: int,
+            num_attn_experts: int = 1,  # ← new
+            top_k: int = 2,
+            dropout: float = 0.1,
+            max_seq_len: int = 256,
     ):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
@@ -431,26 +430,21 @@ class TransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(d_model)
         self.moe_ff = MoEFeedForward(d_model, d_ff, num_ff_experts)
         self.dropout = nn.Dropout(dropout)
-        self.register_buffer("_causal_mask", torch.empty(0), persistent=False)
+        causal = torch.triu(
+            torch.full((max_seq_len, max_seq_len), float("-inf")), 1
+        )
+        self.register_buffer("_causal_mask", causal, persistent=False)
         self.top_k = top_k
 
-    def _get_causal_mask(self, S, device):
-        if self._causal_mask.shape[:2] != (S, S):
-            self._causal_mask = torch.triu(
-                torch.full((S, S), float("-inf"), device=device), 1
-            )
-        return self._causal_mask
-
-    def forward(self, x):
-        mask = self._get_causal_mask(x.size(1), x.device)
-
+    def forward(self, x, top_k=None):
+        S = x.size(1)
+        mask = self._causal_mask[:S, :S]
         # --- attention ------------------------------------------------
         if isinstance(self.self_attn, nn.MultiheadAttention):
             sa_out, _ = self.self_attn(x, x, x, attn_mask=mask, need_weights=False)
             aux_attn = 0.0
         else:
             sa_out, aux_attn = self.self_attn(x, mask)
-
 
         x = x + self.dropout(sa_out)
         x = self.ln1(x)
@@ -470,30 +464,36 @@ class TransformerBlock(nn.Module):
         stats["ffn_by_exp"] = self.moe_ff._token_counts.cpu().tolist()
         return stats
 
+
 class MoETransformerLM(nn.Module):
     """A minimal GPT‑style language model with Mixture‑of‑Experts FFNs."""
 
     def __init__(
-        self,
-        vocab_size: int,
-        d_model: int = 256,
-        n_head: int = 4,
-        num_layers: int = 1,
-        d_ff: int = 1024,
-        num_experts: int = 4,
-        num_attn_experts: int = 4,
-        top_k: int = 2,
-        layer_repetition: int = 4,
-        max_seq_len: int = 256,
-        dropout: float = 0.1,
+            self,
+            vocab_size: int,
+            d_model: int = 256,
+            n_head: int = 4,
+            num_layers: int = 1,
+            d_ff: int = 1024,
+            num_experts: int = 4,
+            num_attn_experts: int = 4,
+            top_k: int = 2,
+            layer_repetition: int = 4,
+            num_initial_layers: int = 2,
+            num_final_layers: int = 2,
+            max_seq_len: int = 256,
+            dropout: float = 0.1,
     ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
-        self.initial_layer = TransformerBlock(d_model, n_head, d_ff,
-                                              num_ff_experts=num_experts,
-                                              num_attn_experts=num_attn_experts,
-                                              dropout=dropout)
+        self.initial_layers = nn.ModuleList(TransformerBlock(d_model, n_head, d_ff,
+                                                             num_ff_experts=num_experts,
+                                                             num_attn_experts=num_attn_experts,
+                                                             dropout=dropout,
+                                                             top_k=top_k,
+                                                             max_seq_len=max_seq_len) for _ in
+                                            range(num_initial_layers))
         self.layers = nn.ModuleList(
             TransformerBlock(
                 d_model,
@@ -502,14 +502,21 @@ class MoETransformerLM(nn.Module):
                 num_ff_experts=num_experts,
                 num_attn_experts=num_attn_experts,
                 dropout=dropout,
+                top_k=top_k,
+                max_seq_len=max_seq_len
             )
             for _ in range(num_layers)
         )
-        self.final_layer = TransformerBlock(d_model, n_head, d_ff,
-                                            num_ff_experts=num_experts,
-                                            num_attn_experts=num_attn_experts,
-                                            dropout=dropout)
+        self.final_layers = nn.ModuleList(TransformerBlock(d_model, n_head, d_ff,
+                                                          num_ff_experts=num_experts,
+                                                          num_attn_experts=num_attn_experts,
+                                                          dropout=dropout,
+                                                          top_k=top_k,
+                                                          max_seq_len=max_seq_len) for _ in range(num_final_layers))
         self.layer_repetition = layer_repetition
+
+        self.repeat_emb = RepeatEmbedding(self.layer_repetition, d_model)
+
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.max_seq_len = max_seq_len
@@ -527,33 +534,92 @@ class MoETransformerLM(nn.Module):
         x = self.token_emb(idx) + self.pos_emb(pos)
 
         aux_losses = 0.0
-        for i in range(self.layer_repetition):
+
+        for init_layer in self.initial_layers:
+            x, aux = init_layer(x)
+            aux_losses = aux_losses + aux
+        for rep in range(self.layer_repetition):
+            x = self.repeat_emb(rep, x)
             for layer in self.layers:
                 x, aux = layer(x)
                 aux_losses = aux_losses + aux
 
+        for final_layer in self.final_layers:
+            x, aux = final_layer(x)
+            aux_losses = aux_losses + aux
 
         x = self.ln_f(x)
         logits = self.head(x)
         return logits, aux_losses
 
     def token_statistics(self) -> dict:
-        out = dict(total=0, attn_by_exp=None, ffn_by_exp=None)
-        for blk in self.layers:
-            s = blk.expert_token_stats()
-            out["total"] += s.get("attn_total", 0) + s["ffn_total"]
+        """
+        Returns
+        -------
+        stats : dict
+            {
+              "total"          : int,                # real tokens seen by the model
+              "attn_by_exp"    : list[int] | None,   # aggregate across *all* layers
+              "ffn_by_exp"     : list[int],
+              "layers"         : [                   # NEW – one entry per block
+                  {
+                    "name"         : str,            # "init", "L0", "L1", …, "final"
+                    "attn_total"   : int,            # present only if MoE attention
+                    "attn_by_exp"  : list[int] | None,
+                    "ffn_total"    : int,
+                    "ffn_by_exp"   : list[int],
+                  },
+                  …
+              ],
+            }
+        """
 
-            # first layer defines list length – afterwards element‑wise sum
-            def _merge(key, src):
-                if src is None: return
-                if out[key] is None:
-                    out[key] = src.copy()
+        # ------------------------------------------------------------------
+        # A helper that merges element‑wise counts (used for the aggregates)
+        def _merge(dst, src):
+            if src is None:
+                return dst
+            if dst is None:
+                return src.copy()
+            for i, v in enumerate(src):
+                if i >= len(dst):
+                    dst.append(v)
                 else:
-                    for i, v in enumerate(src):
-                        out[key][i] += v
-            _merge("attn_by_exp", s.get("attn_by_exp"))
-            _merge("ffn_by_exp",  s["ffn_by_exp"])
-        return out
+                    dst[i] += v
+            return dst
+
+        # ------------------------------------------------------------------
+
+        blocks = [(f"init{i}", blk) for i, blk in enumerate(self.initial_layers)] + \
+                 [(f"L{i}", blk) for i, blk in enumerate(self.layers)] + \
+                 [(f"final{i}", blk) for i, blk in enumerate(self.final_layers)]
+
+        # True “how many tokens have passed through the model?”
+        true_total = int(self.initial_layers[0].moe_ff._total_tokens)
+
+        agg_attn, agg_ffn = None, None
+        per_layer: list[dict] = []
+
+        for name, blk in blocks:
+            bstats = blk.expert_token_stats()  # local stats for this block
+
+            per_layer.append({
+                "name": name,
+                "attn_total": bstats.get("attn_total", 0),
+                "attn_by_exp": bstats.get("attn_by_exp"),
+                "ffn_total": bstats["ffn_total"],
+                "ffn_by_exp": bstats["ffn_by_exp"],
+            })
+
+            agg_attn = _merge(agg_attn, bstats.get("attn_by_exp"))
+            agg_ffn = _merge(agg_ffn, bstats["ffn_by_exp"])
+
+        return {
+            "total": true_total,
+            "attn_by_exp": agg_attn,
+            "ffn_by_exp": agg_ffn,
+            "layers": per_layer,
+        }
 
 
 # -----------------------------------------------------------------------------

@@ -26,18 +26,20 @@ import argparse
 import itertools
 import logging
 import math
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from datasets import load_dataset
-from transformers import AutoTokenizer
-from tqdm.auto import tqdm
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
-from fat_moe import MoETransformerLM  # assumes moe_llm.py is on PYTHONPATH
+from fat_moe import MoETransformerLM, MoEFeedForward
 
 try:
     from aim import Run  # type: ignore
@@ -45,13 +47,12 @@ except ImportError:  # Degrade gracefully if Aim isn't available
     Run = None  # type: ignore[misc,assignment]
 
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _setup_logger() -> logging.Logger:
-    fmt = "% (asctime)s | %(levelname)8s | %(message)s"
+    fmt = "%(asctime)s | %(levelname)8s | %(message)s"
     datefmt = "%H:%M:%S"
     logging.basicConfig(level=logging.INFO, format=fmt, datefmt=datefmt, stream=sys.stdout)
     logger = logging.getLogger("train")
@@ -60,6 +61,7 @@ def _setup_logger() -> logging.Logger:
     logger.propagate = False
     return logger
 
+
 def stream_tokens(dataset_iter: Iterable[dict], tokenizer, seq_len: int) -> Iterable[torch.Tensor]:
     """Pack incoming texts into contiguous `seq_len+1` chunks of token IDs."""
     buf: List[int] = []
@@ -67,7 +69,7 @@ def stream_tokens(dataset_iter: Iterable[dict], tokenizer, seq_len: int) -> Iter
         buf.extend(tokenizer(sample["text"], add_special_tokens=False)["input_ids"] + [tokenizer.eos_token_id])
         while len(buf) > seq_len:
             chunk = buf[: seq_len + 1]
-            buf = buf[seq_len + 1 :]
+            buf = buf[seq_len + 1:]
             yield torch.tensor(chunk, dtype=torch.long)
 
 
@@ -88,10 +90,11 @@ def top_k_sample(logits: torch.Tensor, k: int = 50, temperature: float = 1.0) ->
     return indices[next_idx].item()
 
 
-def generate(model: MoETransformerLM, tokenizer, prompt: str, max_new_tokens: int = 64, temperature: float = 1.0, top_k: int = 50, device="cpu") -> str:
+def generate(model: MoETransformerLM, tokenizer, prompt: str, max_new_tokens: int = 64, temperature: float = 1.0,
+             top_k: int = 50, device="cpu") -> str:
     """Greedy/top‑k generator for quick qualitative checks."""
     tokens = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    tokens = tokens[-model.max_seq_len :]
+    tokens = tokens[-model.max_seq_len:]
 
     for _ in range(max_new_tokens):
         idx = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
@@ -127,6 +130,35 @@ def short_num(n):
     return f"{formatted}{millnames[millidx]}"
 
 
+def format_duration(seconds: float) -> str:
+    total_seconds = int(round(seconds))
+
+    # Compute days, hours, minutes, and seconds.
+    days, remainder = divmod(total_seconds, 86400)  # 86400 seconds in a day
+    hours, remainder = divmod(remainder, 3600)  # 3600 seconds in an hour
+    minutes, secs = divmod(remainder, 60)  # 60 seconds in a minute
+
+    parts = []
+    # If there are days, show days, hours, and minutes (ignore seconds)
+    if days > 0:
+        parts.append(f"{days}d")
+        parts.append(f"{hours}h")
+        parts.append(f"{minutes}m")
+    # If there are hours but no days, show hours and minutes (ignore seconds)
+    elif hours > 0:
+        parts.append(f"{hours}h")
+        parts.append(f"{minutes}m")
+    # If it's less than one hour, show minutes and seconds (or only seconds if under a minute)
+    else:
+        if minutes > 0:
+            parts.append(f"{minutes}m")
+            parts.append(f"{secs}s")
+        else:
+            parts.append(f"{secs}s")
+
+    return " ".join(parts)
+
+
 def evaluate_perplexity(model: MoETransformerLM, token_chunks: List[torch.Tensor], device, vocab_size) -> float:
     """Compute perplexity on pre‑chunked token blocks.
 
@@ -147,38 +179,113 @@ def evaluate_perplexity(model: MoETransformerLM, token_chunks: List[torch.Tensor
     return math.exp(total_loss / total_tokens)
 
 
+def noise_schedule(step: int, total: int,
+                   warmup: float = 0.10, decay: float = 0.30,
+                   start: float = 1.0, end: float = 0.0) -> float:
+    if step < warmup * total:
+        return start
+    t = (step - warmup * total) / (decay * total)
+    if t < 1.0:
+        return start * (1 - t) + end * t  # linear
+    return end
+
+
+def set_noise_std(model, value: float) -> None:
+    """Recursively set `noise_std` on every MoE FFN in `model`."""
+    for mod in model.modules():
+        if isinstance(mod, MoEFeedForward):
+            mod.noise_std = value
+
+
+def pack_sequences(examples,
+                   chunk_len: int = 513,  # seq_len + 1
+                   eos_id: int | None = None):
+    """
+    Turn a batch of variable‑length `input_ids` into fixed‑length blocks.
+
+    Returns
+    -------
+    dict: {"input_ids": List[List[int]]}
+          (the outer list = new rows, the inner list = token ids)
+    """
+    # 1. flatten + add <EOS>
+    stream: list[int] = []
+    for ids in examples["input_ids"]:
+        stream.extend(ids)
+        if eos_id is not None:
+            stream.append(eos_id)
+
+    # 2. drop the tail that doesn’t fill a full block (optional)
+    total = len(stream) // chunk_len * chunk_len
+    stream = stream[:total]
+
+    # 3. split into blocks
+    blocks = [stream[i: i + chunk_len]
+              for i in range(0, total, chunk_len)]
+
+    # 4. HuggingFace will expand the outer list into new rows
+    return {"input_ids": blocks}
+
+def pack_and_tokenise(batch,
+                      tokenizer,
+                      chunk_len=513,          # global fast‑tokeniser
+                      eos_id=None,
+                      ):
+    # 1) tokenise all texts in the batch at once
+    ids = tokenizer(batch["text"], add_special_tokens=False)["input_ids"]
+
+    # 2) flatten & add <eos>
+    stream = list(itertools.chain.from_iterable(ids))
+    if eos_id is not None:
+        stream = list(itertools.chain.from_iterable(
+            (seq + [eos_id] for seq in ids)
+        ))
+
+    # 3) chop to fixed blocks
+    total = len(stream) // chunk_len * chunk_len
+    blocks = [stream[i:i+chunk_len] for i in range(0, total, chunk_len)]
+    return {"input_ids": blocks}
+
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dim", type=int, default=512)
-    parser.add_argument("--num_layers", type=int, default=2)
-    parser.add_argument("--layer_repetition", type=int, default=4)
-    parser.add_argument("--num_experts", type=int, default=8)
+    parser.add_argument("--model_dim", type=int, default=768)
+    parser.add_argument("--num_layers", type=int, default=1)
+    parser.add_argument("--layer_repetition", type=int, default=1)
+    parser.add_argument("--num_experts", type=int, default=4)
     parser.add_argument("--num_attn_experts", type=int, default=1)
     parser.add_argument("--top_k", type=int, default=2)
-    parser.add_argument("--ff_dim", type=int, default=2048)
-    parser.add_argument("--num_heads", type=int, default=16)
+    parser.add_argument("--ff_dim", type=int, default=3072)
+    parser.add_argument("--num_heads", type=int, default=12)
     parser.add_argument("--seq_len", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--steps", type=int, default=100000)
-    parser.add_argument("--eval_tokens", type=int, default=1024*8, help="Number of tokens from WikiText‑2 for perplexity")
+    parser.add_argument("--eval_tokens", type=int, default=1024 * 64,
+                        help="Number of tokens from WikiText‑2 for perplexity")
     parser.add_argument("--sample_prompt", type=str, default="The purpose of education is")
     parser.add_argument("--sample_tokens", type=int, default=60)
     parser.add_argument("--save_dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--log_every", type=int, default=10, help="Logging frequency (in steps)")
-
+    parser.add_argument("--grad_accum", type=int, default=8,
+                        help="Micro‑batches to accumulate before an optimizer step")
+    parser.add_argument("--capacity_factor", type=float, default=1.25)
 
     args = parser.parse_args()
     logger = _setup_logger()
 
     aim_run: Optional[Run] = None
     if Run is not None:
-        aim_run = Run(experiment="fineweb‑moe")
-        aim_run["hparams"] = vars(args)
+        aim_run = Run(experiment="fineweb-moe")
+        for k, v in vars(args).items():
+            if k not in ["save_dir", "sample_prompt", "sample_tokens"]:
+                aim_run[k] = v
+        # aim_run["hparams"] = args
         logger.info("Aim tracking enabled ‑ run hash: %s", aim_run.hash)
     else:
         logger.warning("Aim is not installed; metrics will not be tracked.")
@@ -221,15 +328,13 @@ def main():
     layer_params = sum(p.numel() for p in model.layers.parameters() if p.requires_grad)
     effective_total = (num_params - layer_params) + layer_params * args.layer_repetition
 
-
     per_expert = sum(p.numel() for p in model.layers[0].moe_ff.experts[0].parameters())
     active_per_ff = per_expert * (args.num_experts - args.top_k)
     one_layer = sum(p.numel() for p in model.layers[0].parameters())
-    active_param_layer = (one_layer - (per_expert*args.num_experts)) + per_expert * args.top_k
+    active_param_layer = (one_layer - (per_expert * args.num_experts)) + per_expert * args.top_k
     without_layers = num_params - (one_layer * (args.num_layers + 2))  # 2 for initial and final
-    one_tok = (without_layers + (active_param_layer * 2)) # + 2 for initial and final
+    one_tok = (without_layers + (active_param_layer * 2))  # + 2 for initial and final
     one_tok += (active_param_layer * args.num_layers) * args.layer_repetition
-
 
     logger.info("Model has %s parameters", short_num(num_params))
     logger.info("Model has %s effective parameters", short_num(effective_total))
@@ -240,68 +345,119 @@ def main():
     # Streaming FineWeb‑Edu dataset
     logger.info("Loading FineWeb‑Edu... (this may take a moment on first run)")
     # dataset = load_dataset("google/wiki40b", "en", split="train", streaming=True)
-    dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train")
-    token_stream = stream_tokens(dataset, tokenizer, args.seq_len)
-    batch_stream = batcher(token_stream, args.batch_size)
+    dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train[:1%]")
 
+    tokenised = (dataset.
+        shuffle()
+        .map(
+            pack_and_tokenise,
+            batched=True,
+            batch_size=10_000,
+            num_proc = int(os.cpu_count()/2),
+            fn_kwargs={"tokenizer": tokenizer, "chunk_len": args.seq_len + 1, "eos_id": tokenizer.eos_token_id},
+            remove_columns=dataset.column_names)).with_format("torch")
+
+    chunk_len = args.seq_len + 1
+    # packed = tokenised.map(pack_sequences,
+    #                        batched=True,
+    #                        batch_size=1000,
+    #                        remove_columns=tokenised.column_names,
+    #                        fn_kwargs={"chunk_len": chunk_len, "eos_id": tokenizer.eos_token_id}).with_format("torch")
+
+    loader = DataLoader(tokenised,
+                        batch_size=args.batch_size,
+                        num_workers=int(os.cpu_count()/2),
+                        pin_memory=True,
+                        drop_last=True,
+                        collate_fn=lambda batch: torch.stack(
+                            [row["input_ids"] for row in batch]))  # GPU‑friendly batches
+    def infinite_loader(loader: DataLoader) -> Iterable[torch.Tensor]:
+        """Yield batches endlessly."""
+        while True:
+            for batch in loader:
+                yield batch
+    batch_iter = infinite_loader(loader)  # endless stream
 
     # Evaluation dataset (small slice of WikiText‑2)
     logger.info("Preparing WikiText‑2 slice for perplexity eval...")
-    wikitext_iter = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", streaming=True)
+    wikitext_iter = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     wt_tokens: List[torch.Tensor] = []
     for chunk in stream_tokens(wikitext_iter, tokenizer, args.seq_len):
         wt_tokens.append(chunk)
         if len(wt_tokens) * (args.seq_len + 1) >= args.eval_tokens:
             break
 
-
     args.save_dir.mkdir(parents=True, exist_ok=True)
-    epoch_step_count = 0
-    total_epochs_passed = 0
 
-    # header = f"{'Step':>6s}/{args.steps:<6d} | Loss: {'Loss':>8s} | Aux: {'Aux':>8s} | Epoch: {'Epoch':>5s}"
-    # logger.info(header)
-    # logger.info("‑" * len(header))
-    for step in range(args.steps):
-        epoch_step_count += 1
-        try:
-            batch = next(batch_stream).to(device)  # (B, seq_len+1)
-        except StopIteration:
-            logger.info("Data iterator exhausted after %d steps; restarting stream.", epoch_step_count)
-            epoch_step_count = 0
-            total_epochs_passed += 1  # Optional
-            token_stream = stream_tokens(dataset, tokenizer, args.seq_len)
-            batch_stream = batcher(token_stream, args.batch_size)
-            batch = next(batch_stream).to(device)
+    tok_seen = 0
+    start_time = time.time()
+    last_log_time = start_time
+    last_tok = 0
 
-        inputs, targets = batch[:, :-1], batch[:, 1:]
-        logits, aux = model(inputs)
-        loss_main = F.cross_entropy(
-            logits.reshape(-1, tokenizer.vocab_size),
-            targets.reshape(-1),
-        )
-        loss = loss_main + 0.01 * aux
+    global_step = 0  # counts **optimizer** steps
+    scheduler = get_cosine_schedule_with_warmup(optim, num_warmup_steps=2000, num_training_steps=args.steps,
+                                                num_cycles=0.5)
 
-        optim.zero_grad(set_to_none=True)
-        loss.backward()
+    while global_step < args.steps:
+        current_std = noise_schedule(global_step, args.steps)
+        set_noise_std(model, current_std)
+        total_loss = 0.0
+
+        for micro in range(args.grad_accum):
+            batch = next(batch_iter).to(device, non_blocking=True)  # (B, seq_len+1)
+
+            inputs, targets = batch[:, :-1], batch[:, 1:]
+            B, S = inputs.shape
+            logits, aux = model(inputs)
+            loss_main = F.cross_entropy(
+                logits.reshape(-1, tokenizer.vocab_size),
+                targets.reshape(-1),
+            )
+            micro_loss = (loss_main + .1 * aux) / args.grad_accum
+            tok_seen += B * S
+            micro_loss.backward()
+            total_loss += micro_loss
+
         optim.step()
+        scheduler.step()
+        optim.zero_grad(set_to_none=True)
+        global_step += 1
 
-        if step % args.log_every == 0 or step == args.steps - 1:
+        if global_step % args.log_every == 0 or global_step == args.steps - 1:
+            now = time.time()
+            interval_toks = tok_seen - last_tok
+            interval_time = now - last_log_time
+            tps = interval_toks / interval_time
+            last_log_time = now
+            last_tok = tok_seen
+            steps_left = args.steps - global_step
+            eta_seconds = (steps_left / args.log_every) * interval_time
             logger.info(
-                f"Step: {step + 1:6d}/{args.steps:<6d} | Loss: {loss_main.item():8.4f} | Aux: {aux.item():8.4f} | Epoch: {total_epochs_passed:5d}"
+                f"Step: {global_step + 1:6d}/{args.steps:<6d} | "
+                f"Loss: {loss_main.item():8.4f} | "
+                f"Aux: {aux.item():8.4f} | "
+                f"tok/s: {short_num(int(tps))} | "
+                f"ETA: {format_duration(eta_seconds)} | "
             )
             stats = model.token_statistics()
             logger.info(
-                "TOKENS total=%s\nattn=%s\n ffn=%s",
-                f"{stats['total']:,}",
-                ", ".join(f"E{i:02}:{short_num(c):9}" for i, c in enumerate(stats.get("attn_by_exp") or [])) or "‑",
+                "TOKENS total=%s | ffn=%s",
+                f"{short_num(stats['total'])}",
                 ", ".join(f"E{i:02}:{short_num(c):9}" for i, c in enumerate(stats["ffn_by_exp"]))
             )
-            if aim_run is not None:
-                aim_run.track(loss_main.item(), name="loss", step=step)
-                aim_run.track(aux.item(), name="aux_loss", step=step)
 
-        if step % 100 == 0:
+            for layer in stats["layers"]:
+                logger.info(
+                    "%s  ffn=%s",
+                    layer["name"].ljust(6),
+                    ", ".join(f"E{i}:{short_num(c):7}" for i, c in enumerate(layer["ffn_by_exp"])),
+                )
+
+            if aim_run is not None:
+                aim_run.track(loss_main.item(), name="loss", step=global_step)
+                aim_run.track(aux.item(), name="aux_loss", step=global_step)
+
+        if global_step % 100 == 0:
             # Qualitative sample
             model.eval()
             sample_text = generate(
@@ -320,22 +476,18 @@ def main():
             ppl = evaluate_perplexity(model, wt_tokens, device, tokenizer.vocab_size)
             logger.info("Perplexity on %d WikiText‑2 tokens: %.2f", len(wt_tokens) * (args.seq_len + 1), ppl)
             if aim_run is not None:
-                aim_run.track(ppl, name="wikitext_perplexity", step=step)
-
+                aim_run.track(ppl, name="wikitext_perplexity", step=global_step)
 
         # --------------------------------------------------------------
         # Checkpoint + sampling
         # --------------------------------------------------------------
-        if (step + 1) % 1000 == 0 or step == args.steps - 1:
-            ckpt_path = args.save_dir / f"step_{step + 1}.pt"
-            torch.save({"model": model.state_dict(), "opt": optim.state_dict(), "step": step + 1}, ckpt_path)
+        if (global_step + 1) % 1000 == 0 or global_step == args.steps - 1:
+            ckpt_path = args.save_dir / f"step_{global_step + 1}.pt"
+            torch.save({"model": model.state_dict(), "opt": optim.state_dict(), "step": global_step + 1}, ckpt_path)
             logger.info("✅ Checkpoint saved to %s", ckpt_path)
-
-
 
     print("🎉 Training completed.")
 
 
 if __name__ == "__main__":
     main()
-
