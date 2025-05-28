@@ -254,18 +254,18 @@ def pack_and_tokenise(batch,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dim", type=int, default=512)
+    parser.add_argument("--model_dim", type=int, default=768)
     parser.add_argument("--num_layers", type=int, default=1)
-    parser.add_argument("--layer_repetition", type=int, default=1)
+    parser.add_argument("--layer_repetition", type=int, default=8)
     parser.add_argument("--num_experts", type=int, default=4)
     parser.add_argument("--num_attn_experts", type=int, default=1)
     parser.add_argument("--top_k", type=int, default=2)
-    parser.add_argument("--ff_dim", type=int, default=2048)
-    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--ff_dim", type=int, default=3072)
+    parser.add_argument("--num_heads", type=int, default=12)
     parser.add_argument("--seq_len", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--steps", type=int, default=100000)
+    parser.add_argument("--steps", type=int, default=50000)
     parser.add_argument("--eval_tokens", type=int, default=1024 * 64,
                         help="Number of tokens from WikiText‑2 for perplexity")
     parser.add_argument("--sample_prompt", type=str, default="The purpose of education is")
@@ -345,10 +345,9 @@ def main():
     # Streaming FineWeb‑Edu dataset
     logger.info("Loading FineWeb‑Edu... (this may take a moment on first run)")
     # dataset = load_dataset("google/wiki40b", "en", split="train", streaming=True)
-    dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train[:1%]")
+    dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train")
 
-    tokenised = (dataset.
-        shuffle()
+    tokenised = (dataset
         .map(
             pack_and_tokenise,
             batched=True,
