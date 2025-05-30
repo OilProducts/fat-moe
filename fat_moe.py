@@ -397,8 +397,11 @@ class HeadSwitchSelfAttention(nn.Module):
         # Pre‑compute x reshaped once to (B,S,h,d_h) for all heads
         x_h = x.view(B, S, self.h, self.d_h)
 
-        v_out = torch.zeros_like(x_h)  # (B,S,h,d_h)
-        o_out = torch.zeros_like(x_h)
+        # v_out = torch.zeros_like(x_h)  # (B,S,h,d_h)
+        # o_out = torch.zeros_like(x_h)
+
+        v_out = torch.zeros(self.h, B, S, self.d_h, device=x.device, dtype=x.dtype)
+        o_out = torch.zeros(self.h, B, S, self.d_h, device=x.device, dtype=x.dtype)
 
         # loop over k (tiny, usually 1)
         for slot in range(self.k):
