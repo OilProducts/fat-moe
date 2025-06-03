@@ -4,7 +4,7 @@ from math import sqrt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Any
 
 # ──────────────────────────────────────────────────────────────────────────
 # 1.  Utilities copied from previous snippets
@@ -72,14 +72,6 @@ def build_segment_queries_mask(
     valid = torch.arange(S_hat, device=device)[None, :] < seg_count[:, None]  # (B,Ŝ)
 
     return queries, att_mask, valid
-
-# def safe_softmax(attn_scores, dim=-1):
-#     attn_scores = attn_scores.clone()
-#     all_masked = torch.isneginf(attn_scores).all(dim=dim, keepdim=True)
-#     attn_scores = attn_scores.masked_fill(all_masked, 0.0)  # avoid row of -inf
-#     attn = F.softmax(attn_scores, dim=dim)
-#     attn = attn.masked_fill(all_masked, 0.0)                #     …and of NaN
-#     return attn
 
 def safe_softmax(scores: torch.Tensor,
                  mask: torch.Tensor,             # same shape, True ⇒ block
@@ -304,8 +296,6 @@ class SlidingWindowAttention(nn.Module):
     Notes
     -----
     •  The implementation builds an explicit (seq_len, seq_len) boolean mask.
-       For very long sequences you may want a block‑sparse or chunked
-       implementation instead – let me know if you need that!
     •  The layer is causal by design (no look‑ahead).
     """
 
@@ -476,7 +466,8 @@ class ByteSegmentCompressor(nn.Module):
 
         return {'continuous': quantised,
                 'codes'     : codes,
-                'vq_loss'   : vq_loss}
+                'vq_loss'   : vq_loss,
+                'valid_mask': valid}
 
 
 class CodeExpander(nn.Module):
@@ -733,6 +724,381 @@ class ByteLevelTokenizer:
         you can implement it here. Not strictly necessary for a minimal reproducing example.
         """
         raise NotImplementedError()
+
+
+class HierarchicalAutoencoder(nn.Module):
+    """
+    Encapsulates a stack of ByteSegmentCompressors and CodeExpanders
+    for hierarchical compression and decompression of byte sequences.
+    """
+
+    def __init__(self,
+                 num_levels: int,
+                 # Compressor configurations (one dict per level)
+                 # Each dict should contain args for ByteSegmentCompressor:
+                 # {'dim': int, 'heads': int, 'window': int, 'num_queries': int, 'codebook_size': int, 'beta': float}
+                 # The 'vocab_size' for the first compressor is initial_vocab_size.
+                 # For subsequent compressors, 'vocab_size' is the 'codebook_size' of the previous.
+                 compressor_level_configs: List[Dict[str, Any]],
+                 initial_vocab_size: int = 259,  # For the very first level (bytes)
+                 # Expander base configuration (shared across expander levels)
+                 expander_dim_scale: float = 1.0,  # Multiplier for compressor dim to get expander dim
+                 expander_num_enc_layers: int = 4,
+                 expander_num_dec_layers: int = 4,
+                 expander_heads_scale: float = 1.0,  # Multiplier for compressor heads
+                 expander_dropout: float = 0.1,
+                 expander_eos_id: int = 1,  # As used in CodeExpander for BOS padding
+                 expander_max_len: int = 2048,  # Default max generation length
+                 propagate_key_padding_mask: bool = True  # If True, ByteSegmentCompressor must return 'valid_mask'
+                 ):
+        super().__init__()
+
+        if len(compressor_level_configs) != num_levels:
+            raise ValueError("Length of compressor_level_configs must match num_levels.")
+
+        self.num_levels = num_levels
+        self.initial_vocab_size = initial_vocab_size
+        self.expander_eos_id = expander_eos_id
+        self.propagate_key_padding_mask = propagate_key_padding_mask
+
+        # ---- Configure Compressor Stack ----
+        self.compressors = nn.ModuleList()
+        current_input_vocab_size = initial_vocab_size
+        self.actual_codebook_sizes: List[int] = []  # Stores K_i for compressor_i's output
+
+        for i in range(num_levels):
+            config = compressor_level_configs[i]
+            compressor = ByteSegmentCompressor(
+                vocab_size=current_input_vocab_size,
+                dim=config['dim'],
+                heads=config['heads'],
+                window=config['window'],
+                num_queries=config['num_queries'],
+                codebook_size=config['codebook_size'],
+                beta=config['beta']
+            )
+            self.compressors.append(compressor)
+            self.actual_codebook_sizes.append(config['codebook_size'])
+            current_input_vocab_size = config['codebook_size']  # Output of this is input to next
+
+        # ---- Configure Expander Stack ----
+        # Expanders work in reverse order of compression.
+        # self.expanders[0] takes top_codes (output of self.compressors[-1])
+        # self.expanders[-1] reconstructs original byte tokens.
+        self.expanders = nn.ModuleList()
+
+        for i in range(num_levels - 1, -1, -1):
+            # This expander reconstructs the input to self.compressors[i].
+            # Its K_hi (input codes) are the output of self.compressors[i].
+            # Its K_lo (output codes) are the input vocab of self.compressors[i].
+
+            k_hi = self.actual_codebook_sizes[i]
+            base_compressor_config = compressor_level_configs[i]
+
+            if i == 0:  # This expander reconstructs the original byte tokens
+                k_lo = self.initial_vocab_size
+            else:  # This expander reconstructs codes from the previous compression level
+                k_lo = self.actual_codebook_sizes[i - 1]
+
+            exp_dim = int(base_compressor_config['dim'] * expander_dim_scale)
+            exp_heads = int(base_compressor_config['heads'] * expander_heads_scale)
+            if exp_heads == 0: exp_heads = 1  # Ensure at least one head
+
+            expander = CodeExpander(
+                K_hi=k_hi,
+                K_lo=k_lo,
+                D=exp_dim,
+                N_enc=expander_num_enc_layers,
+                N_dec=expander_num_dec_layers,
+                H=exp_heads,
+                dropout=expander_dropout,
+                eos_id=expander_eos_id,
+                max_len=expander_max_len
+            )
+            self.expanders.append(expander)
+        # self.expanders is now [TopExpander, ..., BottomExpander]
+
+    def compress(self, tokens: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        """
+        Applies the full stack of compressors.
+        Args:
+            tokens: Input byte tokens (B, S_initial).
+            key_padding_mask: Optional boolean mask for `tokens` (B, S_initial), True indicates padding.
+        Returns:
+            A dictionary containing:
+                'top_codes': Codes from the final compression level (B, S_top).
+                'all_codes': List of code tensors from each compression level.
+                             [codes_level_0, codes_level_1, ..., codes_level_N-1]
+                'all_continuous': List of continuous (quantized) vectors from each level.
+                'vq_loss': Sum of VQ losses from all levels.
+                'final_key_padding_mask': Key padding mask for 'top_codes' if propagated.
+        """
+        all_codes_list: List[torch.Tensor] = []
+        all_continuous_list: List[torch.Tensor] = []
+        all_input_seq_lengths: List[int] = []
+        all_output_seq_lengths: List[int] = []
+        total_vq_loss = torch.tensor(0., device=tokens.device, dtype=torch.float)
+
+        current_input_tokens = tokens
+        current_kpm = key_padding_mask
+
+        # Crucial: ByteSegmentCompressor's forward must return 'valid_mask' (True where segment exists)
+        # for key_padding_mask propagation to work. 'valid_mask' is (B, Q_max).
+        # The new key_padding_mask for the next level becomes `~valid_mask`.
+
+        for i, compressor in enumerate(self.compressors):
+            if current_kpm is not None:
+                # Effective input length is non-padded length
+                input_seq_len = (~current_kpm).sum(dim=1).float().mean().item() # Avg non-padded length
+            else:
+                input_seq_len = current_input_tokens.size(1)
+            all_input_seq_lengths.append(int(input_seq_len))
+
+            comp_out = compressor(current_input_tokens, key_padding_mask=current_kpm)
+            output_codes = comp_out['codes']
+
+            valid_mask_for_output = comp_out.get('valid_mask')
+            if valid_mask_for_output is not None:
+                # Effective output length is number of valid segments
+                output_seq_len = valid_mask_for_output.sum(dim=1).float().mean().item() # Avg valid segments
+            else:
+                output_seq_len = output_codes.size(1)
+            all_output_seq_lengths.append(int(output_seq_len))
+
+            all_codes_list.append(output_codes)
+            all_continuous_list.append(comp_out['continuous'])
+            total_vq_loss += comp_out['vq_loss']
+
+            current_input_tokens = output_codes
+            if self.propagate_key_padding_mask:
+                if valid_mask_for_output is not None:
+                    current_kpm = ~valid_mask_for_output  # Next KPM: True where segment was NOT valid
+                else:
+                    if i < self.num_levels - 1:
+                        print(
+                            f"Warning: 'valid_mask' not returned by compressor {i}. KPM propagation for next level disabled.")
+                    current_kpm = None
+            else:
+                current_kpm = None
+
+        compression_ratios = [
+            (out_len / in_len) if in_len > 0 else 0.0
+            for in_len, out_len in zip(all_input_seq_lengths, all_output_seq_lengths)
+        ]
+
+        return {
+            'top_codes': all_codes_list[-1] if all_codes_list else torch.empty(0, device=tokens.device),
+            'all_codes': all_codes_list,
+            'all_continuous': all_continuous_list,
+            'vq_loss': total_vq_loss,
+            'final_key_padding_mask': current_kpm,
+            'compression_ratios': compression_ratios,  # Ratio of output/input effective lengths
+            'input_seq_lengths': all_input_seq_lengths,  # Effective input lengths to each compressor
+            'output_seq_lengths': all_output_seq_lengths  # Effective output lengths from each compressor
+        }
+
+    def decompress(self,
+                   top_codes: torch.Tensor,
+                   top_codes_key_padding_mask: Optional[torch.Tensor] = None,  # KPM for top_codes
+                   targets_for_teacher_forcing: Optional[List[torch.Tensor]] = None,
+                   # If teacher forcing: list of [codes_level_{N-2}, ..., codes_level_0, original_byte_tokens]
+                   # These are the *target outputs* for each expander from top to bottom.
+                   target_key_padding_masks: Optional[List[Optional[torch.Tensor]]] = None,  # KPMs for targets
+                   max_len_override: Optional[int] = None
+                   ) -> Dict[str, Any]:
+        """
+        Applies the full stack of expanders.
+        Args:
+            top_codes: Codes from the highest compression level (output of self.compressors[-1]).
+            top_codes_key_padding_mask: Optional KPM for top_codes.
+            targets_for_teacher_forcing: If provided, enables teacher forcing. List of target sequences
+                                         for each expander from top down.
+            target_key_padding_masks: Optional KPMs for each target sequence in teacher forcing.
+            max_len_override: Override default max_len for generation.
+        Returns:
+            If training (teacher forcing):
+                'all_logits': List of output logits from each expander.
+                'final_reconstructed_logits': Logits for the original byte sequence.
+            If inference:
+                'generated_sequences': List of generated token sequences from each expander.
+                'final_reconstructed_tokens': Generated byte tokens.
+        """
+        current_codes_to_expand = top_codes
+        current_hi_kpm = top_codes_key_padding_mask  # KPM for codes_hi input to expander
+        all_output_logits_list: List[torch.Tensor] = []
+        all_generated_tokens_list: List[torch.Tensor] = []
+
+        is_training = targets_for_teacher_forcing is not None
+        if is_training and len(targets_for_teacher_forcing) != self.num_levels:
+            raise ValueError("Length of targets_for_teacher_forcing must match num_levels.")
+        if is_training and target_key_padding_masks and len(target_key_padding_masks) != self.num_levels:
+            raise ValueError("Length of target_key_padding_masks must match num_levels if provided.")
+
+        for i in range(self.num_levels):
+            expander = self.expanders[i]  # TopExpander to BottomExpander
+
+            if is_training:
+                target_sequence_for_level = targets_for_teacher_forcing[i]
+                tgt_kpm = target_key_padding_masks[i] if target_key_padding_masks else None
+
+                # CodeExpander's forward needs: codes_hi, codes_lo, (optional masks)
+                # It doesn't explicitly take key_padding_mask for codes_hi or codes_lo in its signature,
+                # but TransformerEncoderLayer/DecoderLayer do.
+                # For now, assume CodeExpander internally handles this or doesn't need explicit KPMs beyond target mask.
+                # This part might need refinement if CodeExpander needs explicit KPMs for encoder/decoder inputs.
+                exp_out = expander(codes_hi=current_codes_to_expand, codes_lo=target_sequence_for_level)
+                all_output_logits_list.append(exp_out['logits'])
+
+                # The input to the *next* expander (as codes_hi) is the *target output* of *this* expander.
+                if i < self.num_levels - 1:
+                    current_codes_to_expand = target_sequence_for_level
+                    current_hi_kpm = tgt_kpm
+            else:  # Inference
+                # CodeExpander.generate might need src_key_padding_mask for its encoder part.
+                # This is current_hi_kpm.
+                # TODO: Modify CodeExpander.generate to accept src_key_padding_mask if necessary.
+                # For now, assuming it's not critical or handled implicitly if short.
+                generated_tokens = expander.generate(codes_hi=current_codes_to_expand,
+                                                     max_len=max_len_override)
+                all_generated_tokens_list.append(generated_tokens)
+                current_codes_to_expand = generated_tokens
+                current_hi_kpm = None  # KPM for generated sequences is typically not used for next step unless it's all EOS
+
+        if is_training:
+            return {
+                'all_logits': all_output_logits_list,
+                'final_reconstructed_logits': all_output_logits_list[-1]
+            }
+        else:
+            return {
+                'generated_sequences': all_generated_tokens_list,
+                'final_reconstructed_tokens': all_generated_tokens_list[-1]
+            }
+
+    def forward(self, tokens: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        """
+        Full forward pass for training: compress, then decompress with teacher forcing, and compute losses.
+        Args:
+            tokens: Input byte tokens (B, S_initial).
+            key_padding_mask: Optional KPM for input tokens.
+        Returns:
+            Dictionary with losses and final logits.
+        """
+        # 1. Compress
+        compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
+        # all_compressed_codes is [codes_L0, codes_L1, ..., codes_L(N-1)]
+        all_compressed_codes = compression_results['all_codes']
+        top_codes = compression_results['top_codes']  # This is codes_L(N-1)
+        vq_loss = compression_results['vq_loss']
+
+        # KPM for top_codes. If subsequent expanders use KPM for their `codes_hi` input.
+        current_top_codes_kpm = compression_results['final_key_padding_mask']
+
+        # --- Metrics for AIM ---
+        compression_ratios = compression_results['compression_ratios']
+        input_seq_lengths = compression_results['input_seq_lengths']
+        output_seq_lengths = compression_results['output_seq_lengths']
+        # --- End Metrics ---
+
+        # 2. Prepare targets for decompression expander stack
+        # self.expanders = [TopExp, Exp_N-2, ..., Exp_0 (BottomExp)]
+        # Target for TopExp (self.expanders[0]) is input to compressor N-1 (which is codes_L(N-2))
+        # Target for self.expanders[i] is input to compressor N-1-i
+        #   which is codes_L(N-2-i)
+        # Target for BottomExp (self.expanders[N-1]) is input to compressor 0 (original tokens)
+        targets_for_expander_stack: List[torch.Tensor] = []
+        # TODO: Prepare target_key_padding_masks for expander stack if propagate_key_padding_mask is True
+        # This requires all_valid_masks from compressor stack.
+
+        for i in range(self.num_levels - 1):  # Targets for expanders[0] to expanders[N-2]
+            # Target for expanders[i] is all_compressed_codes[ (N-1) - 1 - i ]
+            # = all_compressed_codes[ N - 2 - i ]
+            targets_for_expander_stack.append(all_compressed_codes[self.num_levels - 2 - i])
+        targets_for_expander_stack.append(tokens)  # Target for the last expander (bottom one)
+
+        # 3. Decompress with teacher forcing
+        decompression_results = self.decompress(
+            top_codes=top_codes,
+            top_codes_key_padding_mask=current_top_codes_kpm,
+            targets_for_teacher_forcing=targets_for_expander_stack
+            # target_key_padding_masks=... (needs to be built from compressor valid_masks)
+        )
+        all_reconstruction_logits = decompression_results['all_logits']
+
+        # 4. Calculate losses
+        total_reconstruction_loss = torch.tensor(0., device=tokens.device, dtype=torch.float)
+        reconstruction_loss_details: Dict[str, torch.Tensor] = {}
+
+        for i in range(self.num_levels):
+            # all_reconstruction_logits[i] are predictions for targets_for_expander_stack[i]
+            logits_i = all_reconstruction_logits[i]  # (B, S_target, K_target_vocab)
+            target_i = targets_for_expander_stack[i]  # (B, S_target)
+
+            # Assuming CodeExpander's logits and targets are aligned for direct CE.
+            # Original training script used `logits[:,1:,:]` and `target[:,1:]`.
+            # This implies ignoring the first token (e.g., a BOS or unconditioned first prediction).
+            # For simplicity, let's use the whole sequence. If specific slicing is needed,
+            # it can be done before passing to F.cross_entropy.
+            # Or, ensure CodeExpander's output logits and target `codes_lo` match this.
+            # If `CodeExpander.forward`'s `dec_inp` is padded (shifted right) from `codes_lo`,
+            # then `logits` should have same seq_len as `codes_lo`.
+
+            # Reshape for CrossEntropy: logits (N, C, ...), target (N, ...)
+            # logits_i: (B, S, V) -> (B*S, V)
+            # target_i: (B, S) -> (B*S)
+            loss_i = F.cross_entropy(
+                logits_i.reshape(-1, logits_i.size(-1)),
+                target_i.reshape(-1),
+                # ignore_index=... # TODO: Add pad_token_id if applicable
+            )
+
+            expander_k_lo = self.expanders[i].K_lo
+            level_name = f"reconstruction_to_K{expander_k_lo}" + \
+                         (
+                             "_bytes" if expander_k_lo == self.initial_vocab_size else f"_codesL{self.num_levels - 2 - i if i < self.num_levels - 1 else '?'}")
+
+            reconstruction_loss_details[level_name] = loss_i
+            total_reconstruction_loss += loss_i
+
+        # Average reconstruction loss over levels
+        avg_reconstruction_loss = total_reconstruction_loss / self.num_levels if self.num_levels > 0 else torch.tensor(
+            0.)
+        final_total_loss = avg_reconstruction_loss + vq_loss
+
+        return {
+            'total_loss': final_total_loss,
+            'vq_loss': vq_loss,
+            'avg_reconstruction_loss': avg_reconstruction_loss,
+            'reconstruction_loss_details': reconstruction_loss_details,
+            'final_reconstructed_logits': decompression_results['final_reconstructed_logits'],
+            # --- Metrics for AIM ---
+            'compression_ratios': compression_ratios,
+            'input_seq_lengths_compressors': input_seq_lengths,
+            'output_seq_lengths_compressors': output_seq_lengths,
+        }
+
+    @torch.no_grad()
+    def generate_bytes(self,
+                       tokens: torch.Tensor,
+                       key_padding_mask: Optional[torch.Tensor] = None,
+                       max_len_override: Optional[int] = None) -> torch.Tensor:
+        """
+        Compresses input byte tokens and then autoregressively generates
+        the reconstructed byte tokens.
+        """
+        self.eval()  # Ensure model is in evaluation mode (for dropout, etc.)
+        compression_results = self.compress(tokens, key_padding_mask=key_padding_mask)
+        top_codes = compression_results['top_codes']
+        top_codes_kpm = compression_results['final_key_padding_mask']  # KPM for top_codes
+
+        decompression_results = self.decompress(
+            top_codes=top_codes,
+            top_codes_key_padding_mask=top_codes_kpm,
+            targets_for_teacher_forcing=None,  # Inference mode
+            max_len_override=max_len_override
+        )
+        return decompression_results['final_reconstructed_tokens']
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # 6.  Example usage
