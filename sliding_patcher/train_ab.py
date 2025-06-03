@@ -42,6 +42,8 @@ BATCH_SIZE     = 64
 TOTAL_STEPS    = 20_000
 LR             = 3e-4
 DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")  # Use Metal Performance Shaders on macOS
 
 DIM            = 256           # shared dim per layer
 HEADS          = 8
@@ -60,8 +62,22 @@ exp_config = {
     "num_levels": 2,
     "initial_vocab_size": 259,
     "compressor_level_configs": [
-        {"dim": 256, "heads": 8, "window": 128, "num_queries": 1, "codebook_size": 2048, "beta": 0.25},
-        {"dim": 512, "heads": 8, "window": 64,  "num_queries": 1, "codebook_size": 32768, "beta": 0.25}
+        {"dim": 256, "heads": 8, "window": 128,
+         "num_encoder_layers": 4,
+         'encoder_ffn_dim_multiplier': 4,
+         'encoder_dropout': 0.1,
+         'max_seq_len_encoder': 4096,
+         "num_queries": 1,
+         "codebook_size": 2048,
+         "beta": 0.25},
+        {"dim": 512, "heads": 8, "window": 64,
+         "num_encoder_layers": 4,
+         'encoder_ffn_dim_multiplier': 4,
+         'encoder_dropout': 0.1,
+         'max_seq_len_encoder': 4096,
+         "num_queries": 1,
+         "codebook_size": 32768,
+         "beta": 0.25}
     ],
     "expander_dim_scale": 1.0, "expander_num_enc_layers": 3, "expander_num_dec_layers": 3,
     "expander_heads_scale": 1.0, "expander_dropout": 0.1, "expander_eos_id": 1,
@@ -69,7 +85,7 @@ exp_config = {
     "learning_rate": 1e-4,
     "batch_size": 16,
     "num_epochs": 10,
-    "log_interval": 10, # Log metrics to AIM every N steps
+    "log_interval": 1, # Log metrics to AIM every N steps
 }
 
 # --- AIM Setup ---
@@ -253,7 +269,8 @@ BATCH_SIZE = 4
 print(f"\nLoading dataset '{DATASET_NAME}' with configuration '{DATASET_CONFIG}'...")
 raw_dataset = None
 try:
-    raw_dataset = load_dataset(DATASET_NAME, name=DATASET_CONFIG, split="train")
+    raw_dataset = load_dataset(DATASET_NAME, name=DATASET_CONFIG, split="train[:10000]")  # Load
+    # a subset for testing
     # raw_dataset = raw_dataset.select(range(1000)) # Optional: for faster testing
     print(f"Dataset loaded. Number of examples: {len(raw_dataset)}")
 except Exception as e:

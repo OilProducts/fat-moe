@@ -379,25 +379,110 @@ class SlidingWindowAttention(nn.Module):
         y = self.out_proj(y)
         return y
 
-class SlidingWindowTransformer(nn.Module):
-    def __init__(self, dim, heads, window, vocab):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab, dim)
-        self.attn = SlidingWindowAttention(dim, heads, window)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, 4*dim), nn.ReLU(), nn.Linear(4*dim, dim)
-        )
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
-        self.proj = nn.Linear(dim, vocab)
 
-    def forward(self, x):                         # x: (B,S)
-        h = self.embedding(x)
-        h = h + self.attn(self.norm1(h))
-        h = h + self.ffn(self.norm2(h))
-        logits = self.proj(self.norm3(h))                     # (B,S,V)
-        return h, logits                          # hidden + logits
+class SlidingWindowTransformerBlock(nn.Module):
+    """
+    A single block of a Sliding Window Transformer encoder, typically consisting of:
+    1. LayerNorm -> SlidingWindowAttention -> Dropout -> Residual Connection
+    2. LayerNorm -> FeedForward Network -> Dropout -> Residual Connection
+    """
+
+    def __init__(self, dim: int, num_heads: int, window_size: int,
+                 ffn_dim_multiplier: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = SlidingWindowAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            window_size=window_size,
+            dropout=dropout
+        )
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * ffn_dim_multiplier),
+            nn.GELU(),  # GELU is common, ReLU is also fine
+            nn.Dropout(dropout),  # Dropout within FFN
+            nn.Linear(dim * ffn_dim_multiplier, dim)
+        )
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Pre-LN variant (often more stable for deeper networks)
+        # x_norm1 = self.norm1(x)
+        # attn_out = self.attn(x_norm1, key_padding_mask=key_padding_mask)
+        # x = x + self.dropout1(attn_out)
+
+        # x_norm2 = self.norm2(x)
+        # ffn_out = self.ffn(x_norm2)
+        # x = x + self.dropout2(ffn_out)
+        # return x
+
+        # Original Transformer-style Post-LN (as in your first snippet's Transformer)
+        # If your original SlidingWindowTransformer used Post-LN, stick to it for consistency first
+        # The norm was before attn and ffn in your original single layer, let's refine based on that structure.
+
+        # Adhering to the structure: norm -> op -> dropout -> residual
+        x_norm1 = self.norm1(x)
+        attn_out = self.attn(x_norm1, key_padding_mask=key_padding_mask)
+        x = x + self.dropout1(attn_out)
+
+        x_norm2 = self.norm2(x)
+        ffn_out = self.ffn(x_norm2)
+        x = x + self.dropout2(ffn_out)
+        return x
+
+
+class DeeperSlidingWindowEncoder(nn.Module):  # Renamed to be more descriptive
+    def __init__(self, vocab_size: int, dim: int, num_heads: int, window_size: int,
+                 num_layers: int, ffn_dim_multiplier: int = 4, dropout: float = 0.1,
+                 max_seq_len: int = 4096):  # max_seq_len for positional encoding
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, dim)
+        # Positional encodings are crucial for Transformers, especially with absolute attention windows
+        self.pos_encoding = nn.Parameter(torch.randn(1, max_seq_len, dim) * 0.02)  # Learned PE
+        self.embed_dropout = nn.Dropout(dropout)
+
+        self.layers = nn.ModuleList([
+            SlidingWindowTransformerBlock(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=window_size,
+                ffn_dim_multiplier=ffn_dim_multiplier,
+                dropout=dropout
+            ) for _ in range(num_layers)
+        ])
+
+        self.final_norm = nn.LayerNorm(dim)  # Apply LayerNorm before logit projection
+        self.logit_proj = nn.Linear(dim, vocab_size)
+
+    def forward(self, token_ids: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None) -> Tuple[
+        torch.Tensor, torch.Tensor]:
+        B, S = token_ids.shape
+        x = self.embedding(token_ids)
+
+        if S > self.pos_encoding.size(1):
+            raise ValueError(
+                f"Input sequence length ({S}) exceeds max_seq_len for positional encoding ({self.pos_encoding.size(1)})")
+        x = x + self.pos_encoding[:, :S, :]
+
+        x = self.embed_dropout(x)
+
+        for layer in self.layers:
+            x = layer(x, key_padding_mask=key_padding_mask)
+            # x is the hidden state output from each block
+
+        # Hidden states for pooling should be the output of the last Transformer block
+        hidden_states_for_pooling = x
+
+        # Project to logits
+        normed_output = self.final_norm(hidden_states_for_pooling)
+        logits = self.logit_proj(normed_output)  # (B, S, V)
+
+        return hidden_states_for_pooling, logits
 
 # ──────────────────────────────────────────────────────────────────────────
 # 5.  The full byte‑sequence compressor
@@ -417,15 +502,31 @@ class ByteSegmentCompressor(nn.Module):
       }
     """
     def __init__(self,
-                 vocab_size: int = 259,           # 0‑255 + specials
+                 vocab_size: int = 259,
                  dim: int = 256,
-                 heads: int = 8,
-                 window: int = 128,
-                 num_queries: int = 1,
+                 heads: int = 8, # For both encoder and pooler
+                 window: int = 128, # For encoder
+                 num_encoder_layers: int = 3,  # <<< New: Number of encoder layers
+                 encoder_ffn_dim_multiplier: int = 4, # <<< New
+                 encoder_dropout: float = 0.1, # <<< New
+                 max_seq_len_encoder: int = 4096, # <<< New: For encoder's PE
+                 num_queries: int = 1, # L for LearnedQueryAttention
+                 pooler_dropout: float = 0.1, # Dropout for the pooler attention
                  codebook_size: int = 512,
                  beta: float = 0.25):
         super().__init__()
-        self.encoder = SlidingWindowTransformer(dim, heads, window, vocab_size)
+        self.num_queries_per_segment = num_queries # Store L
+
+        self.encoder = DeeperSlidingWindowEncoder(
+            vocab_size=vocab_size,
+            dim=dim,
+            num_heads=heads,
+            window_size=window,
+            num_layers=num_encoder_layers, # Use the new parameter
+            ffn_dim_multiplier=encoder_ffn_dim_multiplier,
+            dropout=encoder_dropout,
+            max_seq_len=max_seq_len_encoder
+        )
         self.pooler  = LearnedQueryAttention(dim, num_queries, heads)
         self.vq      = VectorQuantiser(codebook_size, dim, beta)
 
@@ -769,14 +870,19 @@ class HierarchicalAutoencoder(nn.Module):
         for i in range(num_levels):
             config = compressor_level_configs[i]
             compressor = ByteSegmentCompressor(
-                vocab_size=current_input_vocab_size,
-                dim=config['dim'],
-                heads=config['heads'],
-                window=config['window'],
-                num_queries=config['num_queries'],
-                codebook_size=config['codebook_size'],
-                beta=config['beta']
-            )
+                    vocab_size=current_input_vocab_size,
+                    dim=config['dim'],
+                    heads=config['heads'],
+                    window=config['window'],
+                    num_encoder_layers=config['num_encoder_layers'], # Pass new param
+                    encoder_ffn_dim_multiplier=config.get('encoder_ffn_dim_multiplier', 4), # Add default
+                    encoder_dropout=config.get('encoder_dropout', 0.1), # Add default
+                    max_seq_len_encoder=config.get('max_seq_len_encoder', 4096), # Add default
+                    num_queries=config['num_queries'],
+                    pooler_dropout=config.get('pooler_dropout', 0.1), # Add default
+                    codebook_size=config['codebook_size'],
+                    beta=config['beta']
+                )
             self.compressors.append(compressor)
             self.actual_codebook_sizes.append(config['codebook_size'])
             current_input_vocab_size = config['codebook_size']  # Output of this is input to next
